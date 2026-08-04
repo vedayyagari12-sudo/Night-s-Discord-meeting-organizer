@@ -410,7 +410,7 @@ function renderMe() {
   if (!mine) { $("title").textContent = "My availability"; return; }
   if (mine.error) {
     $("title").textContent = "My availability";
-    $("me-hint").textContent = mine.error + " — run /editlink in Discord for a fresh link.";
+    $("me-hint").textContent = mine.error + " — run /dashboard in Discord for a fresh link.";
     $("ed").innerHTML = "";
     $("save").style.display = $("clearall").style.display = "none";
     return;
@@ -575,7 +575,7 @@ function renderHeat() {
 function renderBest() {
   $("title").textContent = "Best meeting times";
   if (!state.best.length) {
-    $("best").innerHTML = `<div class="empty">No availability submitted yet — run <b>/free</b> in Discord.</div>`;
+    $("best").innerHTML = `<div class="empty">No availability submitted yet — open the <b>My availability</b> tab to add yours.</div>`;
     return;
   }
   const top = state.best[0].count;

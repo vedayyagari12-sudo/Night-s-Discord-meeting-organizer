@@ -7,7 +7,6 @@ Storage stays as a plain JSON file (see DATA_FILE) on purpose -- no database.
 from __future__ import annotations
 
 import asyncio
-import calendar as pycal  # aliased: this module defines a /calendar command
 import copy
 import hashlib
 import hmac
@@ -470,7 +469,7 @@ def _load_secret() -> bytes:
         if PUBLIC_URL:
             log.warning(
                 "DASHBOARD_SECRET is not set. On a hosted deploy the generated key does not "
-                "survive a restart, so every /editlink URL will stop working. Set it as an "
+                "survive a restart, so every /dashboard URL will stop working. Set it as an "
                 "environment variable."
             )
         return value
@@ -578,13 +577,6 @@ async def dashboard_save_user(token: str, avail: dict, off: list, name: str | No
     return {"ok": True, "name": final_name, "avail": cleaned, "off": away}
 
 
-def set_day(data: dict, user: discord.abc.User, day: str, hours: list[int]) -> None:
-    uid = str(user.id)
-    record = data.setdefault(uid, {"name": user.display_name, "avail": {}})
-    record["name"] = user.display_name
-    record["avail"][day] = {"hours": sorted(set(hours)), "updated": _now_iso()}
-
-
 # ---------- time helpers ----------
 def next_occurrence(day: str, hour_index: int) -> datetime:
     """The next upcoming `day` at that slot's start hour, in US Eastern.
@@ -602,38 +594,12 @@ def next_occurrence(day: str, hour_index: int) -> datetime:
     return candidate.replace(tzinfo=TZ)
 
 
-def slot_label(day: str, hour_index: int) -> str:
-    return f"{day} {HOUR_LABELS[hour_index]}"
-
-
 def people_free(data: dict, day: str, hour_index: int) -> list[str]:
     return sorted(
         rec["name"]
         for rec in data.values()
         if hour_index in rec["avail"].get(day, {}).get("hours", [])
     )
-
-
-def calendar_grid(data: dict, *, only_user: str | None = None) -> str:
-    """A fixed-width week grid: rows are hourly slots, columns are days.
-
-    Rendered inside a code block so Discord's monospace font keeps the columns
-    lined up. Shows per-slot head counts, or ✓/· marks for a single user.
-    Kept to 30 characters wide so it doesn't wrap on phones.
-    """
-    if only_user:
-        avail = data.get(only_user, {}).get("avail", {})
-        # ASCII only inside the grid: exotic glyphs can render double-width on
-        # some mobile fonts and knock the columns out of line.
-        cells = {(day, h): "  #" for day, entry in avail.items() for h in entry["hours"]}
-    else:
-        cells = {key: f"{len(people):>3}" for key, people in rank_slots(data)}
-
-    lines = ["TIME     " + "".join(f"{day[:2]:>3}" for day in DAYS)]
-    for hour_index, label in enumerate(HOUR_LABELS):
-        row = "".join(cells.get((day, hour_index), "  ·") for day in DAYS)
-        lines.append(f"{label:<9}{row}")
-    return "```\n" + "\n".join(lines) + "\n```"
 
 
 def hour_range_label(start: int, end: int) -> str:
@@ -792,14 +758,14 @@ def help_embed() -> discord.Embed:
         "Tell me when you're free, and I'll find the times that work for the most "
         "people — then turn one into a real Discord event you can RSVP to.",
     )
-    embed.add_field(name="/free", value="Pick a day, then tap the hours you're free (10AM–8PM). Repeat for each day.", inline=False)
-    embed.add_field(name="/editlink", value="A private link to set your whole week on the web in one go.", inline=False)
-    embed.add_field(name="/my-availability", value="See everything you've currently got saved.", inline=False)
-    embed.add_field(name="/dashboard", value="A link anyone can open to see the full-screen calendar, heatmap and team view — no sign-in needed.", inline=False)
-    embed.add_field(name="/month", value="A real month calendar — page back and forth to see events in advance.", inline=False)
+    embed.add_field(
+        name="/dashboard",
+        value="**Start here.** Your private link to the web dashboard: set your weekly hours, "
+        "mark days you're away, and see the calendar, heatmap and team views.",
+        inline=False,
+    )
+    embed.add_field(name="/best", value="Rank the times that work for the most people. Pick one right from the results to create an event.", inline=False)
     embed.add_field(name="/events", value="Every upcoming team event, grouped by date, with RSVP counts.", inline=False)
-    embed.add_field(name="/status", value="See who on the team has submitted so far.", inline=False)
-    embed.add_field(name="/best", value="Rank the time slots that work for the most people. Pick one right from the results to create an event.", inline=False)
     embed.add_field(
         name="/schedule",
         value=f"Create a Discord Scheduled Event for a specific day and hour. *{' / '.join(SCHEDULE_ROLE_NAMES)} only.*"
@@ -807,30 +773,11 @@ def help_embed() -> discord.Embed:
         else "Create a Discord Scheduled Event for a specific day and hour.",
         inline=False,
     )
-    embed.add_field(name="/clear", value="Clear one day (`/clear day: Tuesday`) or leave the day blank to clear everything.", inline=False)
     embed.add_field(name="/help", value="Show this message.", inline=False)
     embed.add_field(
         name="Heads up",
-        value=f"Availability expires after {AVAILABILITY_TTL.days // 7} weeks so old data doesn't skew results — just re-run `/free` to refresh it.",
-        inline=False,
-    )
-    return embed
-
-
-def availability_embed(name: str, data: dict, user_id: str) -> discord.Embed:
-    avail = data[user_id]["avail"]
-    embed = base_embed(f"{name}'s availability", calendar_grid(data, only_user=user_id), COLOR_OK)
-    total = 0
-    for day in DAYS:
-        entry = avail.get(day)
-        if not entry:
-            continue
-        total += len(entry["hours"])
-        embed.add_field(name=day, value=", ".join(HOUR_LABELS[h] for h in entry["hours"]), inline=False)
-    embed.insert_field_at(
-        0,
-        name="Summary",
-        value=f"**{total}** free hour{'s' if total != 1 else ''} across **{len(avail)}** day(s).",
+        value=f"Availability expires after {AVAILABILITY_TTL.days // 7} weeks so old data doesn't skew "
+        "results — open `/dashboard` to refresh it.",
         inline=False,
     )
     return embed
@@ -891,158 +838,8 @@ def build_agenda(heading: str, items: list[dict]) -> tuple[str, list[discord.Emb
     return f"# {heading}{subtitle}", embeds
 
 
-def availability_agenda_items(data: dict, limit: int = MAX_AGENDA_CARDS) -> list[dict]:
-    """Top availability slots as agenda entries, resolved to real upcoming dates."""
-    total = len(data)
-    top = rank_slots(data)[:limit]
-    items = []
-    for rank, ((day, hour_index), people) in enumerate(top):
-        start = next_occurrence(day, hour_index)
-        medal = f"{MEDALS[rank]} " if rank < len(MEDALS) else ""
-        items.append(
-            {
-                "title": f"{medal}{len(people)} of {total} available",
-                "start": start,
-                "end": start + timedelta(hours=1),
-                "count": len(people),
-                "subtitle": join_names(people, limit=200),
-                # Keyed by day so each weekday keeps a consistent bar color.
-                "key": day,
-            }
-        )
-    items.sort(key=lambda i: i["start"])
-    return items
-
-
 # ---------- month calendar ----------
 WEEKDAY_HEADS = ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
-
-
-def fmt_clock(moment: datetime) -> str:
-    """'2:00 PM' -- %-I isn't portable to Windows, so strip the pad by hand."""
-    return moment.strftime("%I:%M %p").lstrip("0")
-
-
-def month_grid(year: int, month: int, *, events: set[int], proposed: set[int], today: date) -> str:
-    """A real month grid. Four characters per cell keeps every row aligned:
-    a '>' marker for today, the day number, then an event/proposal marker.
-    ASCII only, 28 columns, so it survives phone-width monospace.
-    """
-    lines = ["".join(f" {head} " for head in WEEKDAY_HEADS)]
-    for week in pycal.Calendar(firstweekday=0).monthdayscalendar(year, month):
-        row = ""
-        for day in week:
-            if day == 0:  # padding for days belonging to the adjacent month
-                row += "    "
-                continue
-            is_today = today.year == year and today.month == month and today.day == day
-            marker = "*" if day in events else "+" if day in proposed else " "
-            row += f"{'>' if is_today else ' '}{day:>2}{marker}"
-        lines.append(row.rstrip())
-    return "```\n" + "\n".join(lines) + "\n```"
-
-
-def shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
-    index = (year * 12 + month - 1) + delta
-    return index // 12, index % 12 + 1
-
-
-def month_embed(
-    year: int,
-    month: int,
-    events: list[discord.ScheduledEvent],
-    data: dict,
-) -> discord.Embed:
-    today = datetime.now(TZ).date()
-
-    in_month = sorted(
-        (e for e in events if e.start_time and e.start_time.astimezone(TZ).year == year
-         and e.start_time.astimezone(TZ).month == month),
-        key=lambda e: e.start_time,
-    )
-    event_days = {e.start_time.astimezone(TZ).day for e in in_month}
-
-    # Proposed slots only ever land in the coming week, so they naturally stop
-    # appearing once you page past the current month.
-    proposals = {
-        item["start"]: item
-        for item in availability_agenda_items(data, limit=5)
-        if item["start"].year == year and item["start"].month == month
-    }
-    proposed_days = {start.day for start in proposals} - event_days
-
-    embed = base_embed(
-        f"{pycal.month_name[month]} {year}",
-        month_grid(year, month, events=event_days, proposed=proposed_days, today=today),
-        COLOR_INFO,
-    )
-    embed.add_field(name="Legend", value="`>` today · `*` scheduled event · `+` suggested time", inline=False)
-
-    if in_month:
-        lines = [
-            f"`{e.start_time.astimezone(TZ).day:>2}` **{e.name}** — {fmt_clock(e.start_time.astimezone(TZ))}"
-            for e in in_month[:12]
-        ]
-        if len(in_month) > 12:
-            lines.append(f"*+{len(in_month) - 12} more*")
-        embed.add_field(name=f"Scheduled ({len(in_month)})", value="\n".join(lines), inline=False)
-
-    if proposals:
-        lines = [
-            f"`{start.day:>2}` {item['title']} — {fmt_clock(start)}"
-            for start, item in sorted(proposals.items())
-            if start.day in proposed_days
-        ]
-        if lines:
-            embed.add_field(name="Suggested from availability", value="\n".join(lines), inline=False)
-
-    if not in_month and not proposals:
-        embed.add_field(name="Nothing this month", value="No events scheduled. Run `/best` to find a time.", inline=False)
-    return embed
-
-
-class MonthNavButton(discord.ui.Button):
-    def __init__(self, delta: int | None, label: str, emoji: str | None = None, row: int = 0):
-        style = discord.ButtonStyle.primary if delta == 0 else discord.ButtonStyle.secondary
-        super().__init__(label=label, emoji=emoji, style=style, row=row)
-        self.delta = delta  # None = refresh in place, 0 = jump to today
-
-    async def callback(self, interaction: discord.Interaction):
-        view = cast(MonthView, self.view)
-        if self.delta == 0:
-            now = datetime.now(TZ)
-            view.year, view.month = now.year, now.month
-        elif self.delta is not None:
-            view.year, view.month = shift_month(view.year, view.month, self.delta)
-
-        await interaction.response.defer()
-        # Only the explicit Refresh button bypasses the cache; paging months
-        # reuses what we already have.
-        await view.reload(force=self.delta is None)
-        await interaction.edit_original_response(embed=view.render(), view=view)
-
-
-class MonthView(discord.ui.View):
-    """A pageable month calendar over the guild's real scheduled events."""
-
-    def __init__(self, guild: discord.Guild, year: int, month: int):
-        super().__init__(timeout=600)
-        self.guild = guild
-        self.year = year
-        self.month = month
-        self.events: list[discord.ScheduledEvent] = []
-        # ◀/▶ (U+25C0/U+25B6) have no emoji presentation and Discord rejects
-        # them; the arrow emoji below are the real thing.
-        self.add_item(MonthNavButton(-1, "Prev", "⬅️"))
-        self.add_item(MonthNavButton(0, "Today", "📅"))
-        self.add_item(MonthNavButton(1, "Next", "➡️"))
-        self.add_item(MonthNavButton(None, "Refresh", "🔄"))
-
-    async def reload(self, *, force: bool = False) -> None:
-        self.events = await fetch_events(self.guild, force=force)
-
-    def render(self) -> discord.Embed:
-        return month_embed(self.year, self.month, self.events, load_data())
 
 
 # ---------- permissions ----------
@@ -1063,7 +860,7 @@ def no_permission_embed() -> discord.Embed:
     return base_embed(
         "Only officers can create events",
         f"You need the {roles} role (or the Manage Events permission) to schedule "
-        "a meeting. You can still use `/free`, `/best` and `/calendar`.",
+        "a meeting. You can still use `/dashboard` and `/best`.",
         COLOR_WARN,
     )
 
@@ -1152,7 +949,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 _dashboard_runner = None  # set once the web dashboard binds; see main()
 
 # Scheduled events change rarely but were being re-fetched from Discord on every
-# dashboard poll (every 15s, per guild) and every /month or /events press, which
+# dashboard poll (every 15s, per guild) and every /events press, which
 # is what made everything feel sluggish. Cache them briefly instead.
 EVENTS_TTL = 60.0
 _events_cache: dict[int, tuple[float, list[discord.ScheduledEvent]]] = {}
@@ -1200,160 +997,6 @@ async def fetch_events(
 
 
 # ---------- availability UI ----------
-class DaySelect(discord.ui.Select):
-    def __init__(self, parent_view: "AvailabilityView"):
-        super().__init__(
-            placeholder="1. Choose a day",
-            options=[discord.SelectOption(label=d) for d in DAYS],
-            min_values=1,
-            max_values=1,
-            row=0,
-        )
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.parent_view
-        view.selected_day = self.values[0]
-        # Preload whatever this user already saved for the day, so the buttons
-        # show current state and editing is a tweak rather than a re-entry.
-        record = load_data().get(str(interaction.user.id))
-        view.selected_hours = list(record["avail"].get(view.selected_day, {}).get("hours", [])) if record else []
-        view.refresh_hour_buttons()
-        await interaction.response.edit_message(embed=view.render(), view=view)
-
-
-class HourButton(discord.ui.Button):
-    """One toggle per hour: green when selected, grey when not."""
-
-    def __init__(self, parent_view: "AvailabilityView", hour_index: int, row: int):
-        super().__init__(label=HOUR_START_LABELS[hour_index], style=discord.ButtonStyle.secondary, row=row)
-        self.parent_view = parent_view
-        self.hour_index = hour_index
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.parent_view
-        if not view.selected_day:
-            await interaction.response.send_message(
-                embed=base_embed("Pick a day first", "Choose a day from the dropdown, then tap your free hours.", COLOR_WARN),
-                ephemeral=True,
-            )
-            return
-
-        if self.hour_index in view.selected_hours:
-            view.selected_hours.remove(self.hour_index)
-        else:
-            view.selected_hours.append(self.hour_index)
-        view.selected_hours.sort()
-        view.refresh_hour_buttons()
-        await interaction.response.edit_message(embed=view.render(), view=view)
-
-
-class SelectAllButton(discord.ui.Button):
-    def __init__(self, parent_view: "AvailabilityView"):
-        super().__init__(label="All day", style=discord.ButtonStyle.secondary, row=3)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.parent_view
-        # Toggles: a second tap clears, so one button covers both directions.
-        view.selected_hours = [] if len(view.selected_hours) == len(HOUR_LABELS) else list(range(len(HOUR_LABELS)))
-        view.refresh_hour_buttons()
-        await interaction.response.edit_message(embed=view.render(), view=view)
-
-
-class SaveButton(discord.ui.Button):
-    def __init__(self, parent_view: "AvailabilityView"):
-        super().__init__(label="Save this day", style=discord.ButtonStyle.green, row=3)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.parent_view
-        if not view.selected_day or not view.selected_hours:
-            await interaction.response.send_message(
-                embed=base_embed("Not so fast", "Pick a day **and** at least one hour first.", COLOR_WARN),
-                ephemeral=True,
-            )
-            return
-
-        data = load_data()
-        set_day(data, interaction.user, view.selected_day, view.selected_hours)
-        save_data(data)
-        view.saved[view.selected_day] = list(view.selected_hours)
-        await interaction.response.edit_message(embed=view.render(just_saved=True), view=view)
-
-
-class DoneButton(discord.ui.Button):
-    def __init__(self, parent_view: "AvailabilityView"):
-        super().__init__(label="Done", style=discord.ButtonStyle.blurple, row=3)
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.parent_view
-        if view.saved:
-            embed = base_embed("Availability saved", color=COLOR_OK)
-            for day in DAYS:
-                if day in view.saved:
-                    embed.add_field(
-                        name=day,
-                        value=", ".join(HOUR_LABELS[h] for h in view.saved[day]),
-                        inline=False,
-                    )
-            embed.description = "Run `/best` to find the time that works for the most people."
-        else:
-            embed = base_embed("Nothing saved", "You closed without saving a day. Run `/free` again any time.", COLOR_WARN)
-        await interaction.response.edit_message(embed=embed, view=None)
-        view.stop()
-
-
-class AvailabilityView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.selected_day: str | None = None
-        self.selected_hours: list[int] = []
-        self.saved: dict[str, list[int]] = {}
-        self.add_item(DaySelect(self))
-        # 10 hours across two rows of 5 -- Discord allows 5 buttons per row.
-        for hour_index in range(len(HOUR_LABELS)):
-            self.add_item(HourButton(self, hour_index, row=1 + hour_index // 5))
-        self.add_item(SaveButton(self))
-        self.add_item(SelectAllButton(self))
-        self.add_item(DoneButton(self))
-
-    def refresh_hour_buttons(self) -> None:
-        for item in self.children:
-            if isinstance(item, HourButton):
-                item.style = (
-                    discord.ButtonStyle.success
-                    if item.hour_index in self.selected_hours
-                    else discord.ButtonStyle.secondary
-                )
-
-    def render(self, *, just_saved: bool = False) -> discord.Embed:
-        if just_saved:
-            embed = base_embed("Saved", f"**{self.selected_day}** is locked in.", COLOR_OK)
-        else:
-            embed = base_embed(
-                "Set your free hours",
-                "Pick a day, tap each hour you're free (green = free), then **Save this day**.",
-            )
-
-        embed.add_field(name="Day", value=f"**{self.selected_day}**" if self.selected_day else "*not picked*", inline=True)
-        embed.add_field(
-            name="Hours",
-            value=", ".join(HOUR_LABELS[h] for h in self.selected_hours) if self.selected_hours else "*none selected*",
-            inline=True,
-        )
-        if self.saved:
-            embed.add_field(
-                name="Saved so far",
-                value="\n".join(
-                    f"**{day}** — {', '.join(HOUR_LABELS[h] for h in self.saved[day])}"
-                    for day in DAYS
-                    if day in self.saved
-                ),
-                inline=False,
-            )
-        return embed
 
 
 # ---------- schedule-from-best UI ----------
@@ -1671,29 +1314,8 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=help_embed(), ephemeral=True)
 
 
-@bot.tree.command(name="free", description="Set your free hours (10am-8pm, any day)")
-async def free(interaction: discord.Interaction):
-    view = AvailabilityView()
-    await interaction.response.send_message(embed=view.render(), view=view, ephemeral=True)
-
-
-@bot.tree.command(name="my-availability", description="Show the availability you currently have saved")
-async def my_availability(interaction: discord.Interaction):
-    data = load_data()
-    uid = str(interaction.user.id)
-    if uid not in data:
-        embed = base_embed(
-            "Nothing saved yet",
-            "You haven't submitted any availability. Run `/free` to add some.",
-            COLOR_WARN,
-        )
-    else:
-        embed = availability_embed(interaction.user.display_name, data, uid)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="editlink", description="Get your private link for editing your availability on the web")
-async def editlink(interaction: discord.Interaction):
+@bot.tree.command(name="dashboard", description="Open the web dashboard and set your availability")
+async def dashboard(interaction: discord.Interaction):
     if _dashboard_runner is None:
         await interaction.response.send_message(
             embed=base_embed("Dashboard offline", "The web dashboard isn't running on this bot.", COLOR_WARN),
@@ -1720,52 +1342,6 @@ async def editlink(interaction: discord.Interaction):
             inline=False,
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="dashboard", description="Get a link to the web dashboard, viewable by anyone")
-async def dashboard(interaction: discord.Interaction):
-    if _dashboard_runner is None:
-        await interaction.response.send_message(
-            embed=base_embed("Dashboard offline", "The web dashboard isn't running on this bot.", COLOR_WARN),
-            ephemeral=True,
-        )
-        return
-
-    embed = base_embed(
-        "Web dashboard",
-        f"Anyone with this link can view it — no sign-in required:\n**{public_base_url()}**",
-        COLOR_OK,
-    )
-    embed.add_field(
-        name="Heads up",
-        value="This shows the whole team's names and availability to anyone who has the link.",
-        inline=False,
-    )
-    if not PUBLIC_URL:
-        embed.add_field(
-            name="Note",
-            value="No public address is configured, so this link only works on the computer running the bot.",
-            inline=False,
-        )
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="month", description="Month calendar you can page through to see events in advance")
-@app_commands.describe(ahead="Jump ahead this many months (0 = this month)")
-async def month(interaction: discord.Interaction, ahead: app_commands.Range[int, 0, 24] = 0):
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            embed=base_embed("Server only", "Events live in a server, not in DMs.", COLOR_WARN),
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer()
-    now = datetime.now(TZ)
-    year, month_number = shift_month(now.year, now.month, ahead)
-    view = MonthView(interaction.guild, year, month_number)
-    await view.reload()
-    await interaction.followup.send(embed=view.render(), view=view)
 
 
 @bot.tree.command(name="events", description="Upcoming team events, grouped by date")
@@ -1812,69 +1388,6 @@ async def events(interaction: discord.Interaction):
     await interaction.followup.send(content=content, embeds=embeds)
 
 
-@bot.tree.command(name="clear", description="Clear one day of your availability, or all of it")
-@app_commands.describe(day="Clear only this day. Leave blank to clear every day.")
-@app_commands.choices(day=[app_commands.Choice(name=d, value=d) for d in DAYS])
-async def clear(interaction: discord.Interaction, day: app_commands.Choice[str] | None = None):
-    data = load_data()
-    uid = str(interaction.user.id)
-    record = data.get(uid)
-
-    if record is None:
-        await interaction.response.send_message(
-            embed=base_embed("Nothing to clear", "You didn't have any availability saved.", COLOR_WARN),
-            ephemeral=True,
-        )
-        return
-
-    if day is None:
-        del data[uid]
-        save_data(data)
-        embed = base_embed("Cleared everything", "All of your saved days are gone. Run `/free` to start over.", COLOR_OK)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    if record["avail"].pop(day.value, None) is None:
-        await interaction.response.send_message(
-            embed=base_embed("Nothing to clear", f"You had nothing saved for **{day.value}**.", COLOR_WARN),
-            ephemeral=True,
-        )
-        return
-
-    # A user with no days left shouldn't linger in the file and inflate the
-    # "N members submitted" count that /best ranks against.
-    if not record["avail"]:
-        del data[uid]
-    save_data(data)
-
-    remaining = ", ".join(d for d in DAYS if d in record["avail"])
-    embed = base_embed("Day cleared", f"**{day.value}** removed from your availability.", COLOR_OK)
-    embed.add_field(name="Still saved", value=remaining or "*nothing — you're fully cleared*", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="status", description="Show who has submitted availability")
-async def status(interaction: discord.Interaction):
-    data = load_data()
-    if not data:
-        await interaction.response.send_message(
-            embed=base_embed("No submissions yet", "Nobody has run `/free` yet. Be the first!", COLOR_WARN)
-        )
-        return
-
-    embed = base_embed("Availability submitted", f"**{len(data)}** member(s) have submitted.", COLOR_OK)
-    # Embeds allow at most 25 fields.
-    records = sorted(data.values(), key=lambda r: r["name"].casefold())
-    for record in records[:25]:
-        summary = ", ".join(
-            f"{day} ({len(record['avail'][day]['hours'])}h)" for day in DAYS if day in record["avail"]
-        )
-        embed.add_field(name=record["name"], value=summary or "—", inline=False)
-    if len(records) > 25:
-        embed.description = (embed.description or "") + f"\n*Showing the first 25 of {len(records)}.*"
-    await interaction.response.send_message(embed=embed)
-
-
 @bot.tree.command(name="best", description="Find the best overlapping meeting times")
 @app_commands.describe(top="How many top slots to show (default 5)")
 async def best(interaction: discord.Interaction, top: app_commands.Range[int, 1, 25] = 5):
@@ -1883,7 +1396,7 @@ async def best(interaction: discord.Interaction, top: app_commands.Range[int, 1,
         await interaction.response.send_message(
             embed=base_embed(
                 "No availability yet",
-                "Nobody has submitted times. Run `/free` to add yours, then try `/best` again.",
+                "Nobody has submitted times. Run `/dashboard` to add yours, then try `/best` again.",
                 COLOR_WARN,
             )
         )
