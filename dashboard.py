@@ -4,20 +4,12 @@ Runs inside the bot's own asyncio loop on aiohttp, which discord.py already
 depends on, so there is nothing extra to install. The page is a single
 self-contained document; it polls /api/state for fresh data.
 
-Binds to localhost by default -- the payload contains team members' names, so
-it is not something to put on an open port without thinking about it first.
+Host and port come from the caller: on Render that means 0.0.0.0 and $PORT.
 """
 
 from __future__ import annotations
 
-import atexit
 import logging
-import os
-import re
-import shutil
-import subprocess
-import threading
-from pathlib import Path
 from typing import Awaitable, Callable
 
 from aiohttp import web
@@ -25,108 +17,6 @@ from aiohttp import web
 log = logging.getLogger("meetingbot.dashboard")
 
 StateProvider = Callable[[], Awaitable[dict]]
-
-CLOUDFLARED_URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
-CLOUDFLARED_RELEASE = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-
-
-def find_cloudflared() -> str | None:
-    """Locate the cloudflared binary: an env override, PATH, or next to this file.
-
-    The official download is named cloudflared-windows-amd64.exe, so match any
-    cloudflared*.exe rather than making people rename the file first.
-    """
-    override = os.environ.get("CLOUDFLARED_PATH")
-    if override and Path(override).exists():
-        return override
-    on_path = shutil.which("cloudflared")
-    if on_path:
-        return on_path
-    folder = Path(__file__).resolve().parent
-    for candidate in sorted(folder.glob("cloudflared*.exe")):
-        return str(candidate)
-    return None
-
-
-def kill_stray_tunnels() -> int:
-    """Terminate cloudflared processes left over from earlier bot runs.
-
-    Only touches processes named cloudflared*, and only on Windows where
-    taskkill is available; failures here are never fatal.
-    """
-    if os.name != "nt":
-        return 0
-    try:
-        result = subprocess.run(
-            ["taskkill", "/F", "/IM", "cloudflared*"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return 0
-    killed = result.stdout.count("SUCCESS")
-    if killed:
-        log.info("Cleaned up %d leftover cloudflared process(es)", killed)
-    return killed
-
-
-class PublicTunnel:
-    """A `cloudflared tunnel --url ...` quick tunnel, run as a plain subprocess.
-
-    Quick tunnels need no account or token: cloudflared connects out to
-    Cloudflare's edge and gets back a random *.trycloudflare.com hostname that
-    forwards to our local port. Using plain subprocess + a background thread
-    (rather than asyncio subprocess) sidesteps Windows event-loop quirks with
-    piped subprocess I/O and keeps cleanup working via atexit even if the bot
-    is killed abruptly.
-    """
-
-    def __init__(self, port: int):
-        self.port = port
-        self.url: str | None = None
-        self.error: str | None = None
-        self.process: subprocess.Popen | None = None
-
-    def start(self) -> None:
-        binary = find_cloudflared()
-        if not binary:
-            self.error = "cloudflared-missing"
-            return
-        # Killing the bot's console window skips atexit, so tunnels from earlier
-        # runs survive and pile up. Clear them before starting another.
-        kill_stray_tunnels()
-        try:
-            self.process = subprocess.Popen(
-                [binary, "tunnel", "--url", f"http://127.0.0.1:{self.port}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-        except OSError as exc:
-            self.error = str(exc)
-            return
-        threading.Thread(target=self._watch, daemon=True).start()
-        atexit.register(self.stop)
-
-    def _watch(self) -> None:
-        assert self.process and self.process.stdout
-        for line in self.process.stdout:
-            if not self.url:
-                match = CLOUDFLARED_URL_RE.search(line)
-                if match:
-                    self.url = match.group(0)
-                    log.info("Public dashboard link ready: %s", self.url)
-        # stdout closing means the child is finishing; wait() reaps it so the
-        # return code is actually available (poll() can still read None here).
-        self.process.wait()
-        if not self.url:
-            self.error = "exited"
-            log.warning("cloudflared exited (code %s) before producing a tunnel URL", self.process.returncode)
-
-    def stop(self) -> None:
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -800,6 +690,15 @@ async def start_dashboard(
     async def page(_request: web.Request) -> web.Response:
         return web.Response(text=PAGE, content_type="text/html")
 
+    async def health(_request: web.Request) -> web.Response:
+        """Cheap liveness probe for an external uptime monitor.
+
+        Deliberately touches nothing -- no data load, no Discord calls -- so a
+        ping every few minutes costs essentially nothing and can't fail because
+        some other part of the bot is unhappy.
+        """
+        return web.Response(text="ok", content_type="text/plain")
+
     async def state(_request: web.Request) -> web.Response:
         try:
             return web.json_response(await get_state())
@@ -844,6 +743,8 @@ async def start_dashboard(
 
     app.add_routes([
         web.get("/", page),
+        # web.get also answers HEAD, which is what most uptime monitors send.
+        web.get("/health", health),
         web.get("/api/state", state),
         web.get("/api/me", me_get),
         web.post("/api/me", me_post),

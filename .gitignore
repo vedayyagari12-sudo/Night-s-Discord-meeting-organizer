@@ -15,8 +15,6 @@ availability.tmp
 availability.corrupt.json
 __pycache__/
 
-# 50MB+ binary, downloaded per-machine rather than committed
-cloudflared*.exe
-
 # signs personal edit links; must never be shared
+# (on Render, set DASHBOARD_SECRET as an environment variable instead)
 .dashboard_secret

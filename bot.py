@@ -20,6 +20,7 @@ import traceback
 from collections import defaultdict
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 import discord
@@ -27,7 +28,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from dashboard import CLOUDFLARED_RELEASE, PublicTunnel, start_dashboard
+from dashboard import start_dashboard
 
 load_dotenv()
 
@@ -46,12 +47,33 @@ DATA_FILE = Path(__file__).resolve().parent / "availability.json"
 SAVE_RETRIES = 5
 SAVE_RETRY_DELAY = 0.1
 
-# The dashboard exposes members' names, so it listens on localhost only unless
-# you deliberately change the host. Set DASHBOARD_HOST=0.0.0.0 to reach it from
-# other machines on your network.
-DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
-DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
+# Render's filesystem is wiped on every deploy, so availability lives in the
+# linked Key Value store when one is configured. Falls back to DATA_FILE for
+# local runs, keeping the same JSON shape either way.
+REDIS_URL = (
+    os.environ.get("REDIS_URL")
+    or os.environ.get("KEY_VALUE_URL")
+    or os.environ.get("RENDER_REDIS_URL")
+    or ""
+)
+REDIS_KEY = os.environ.get("REDIS_KEY", "ftc:availability")
+REDIS_WRITE_RETRIES = 3
+PRUNE_INTERVAL = 3600  # seconds between expiry sweeps when Redis-backed
+
+# Render (and most hosts) require binding 0.0.0.0 on the port they hand you in
+# $PORT. Locally that means the dashboard is also reachable from your LAN; set
+# DASHBOARD_HOST=127.0.0.1 in .env if you'd rather keep it to your own machine.
+DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
+DASHBOARD_PORT = int(os.environ.get("PORT") or os.environ.get("DASHBOARD_PORT") or "8080")
 DASHBOARD_ENABLED = os.environ.get("DASHBOARD", "1") != "0"
+
+# Render exposes the service's permanent URL as RENDER_EXTERNAL_URL. Everything
+# that hands out a link uses this, falling back to localhost for local runs.
+PUBLIC_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("PUBLIC_URL") or "").rstrip("/")
+
+
+def public_base_url() -> str:
+    return PUBLIC_URL or f"http://localhost:{DASHBOARD_PORT}"
 
 # All meeting times are interpreted in this timezone. ZoneInfo handles the
 # EST/EDT switch for us, so we never hardcode a UTC offset.
@@ -182,6 +204,129 @@ def _prune_expired(data: dict) -> bool:
 _cache: dict | None = None
 _cache_stamp: tuple[int, int] | None = None
 
+# Key Value plumbing. Writes are queued rather than awaited so that saving never
+# blocks a slash command on a network round trip; _drain_writes coalesces bursts
+# and retries, and storage_close() flushes anything outstanding on shutdown.
+_redis: Any = None
+_pending_payload: str | None = None
+_write_task: "asyncio.Task | None" = None
+_last_prune = 0.0
+
+
+def _queue_redis_write(payload: str) -> None:
+    global _pending_payload, _write_task
+    _pending_payload = payload
+    if _write_task is None or _write_task.done():
+        try:
+            _write_task = asyncio.get_running_loop().create_task(_drain_writes())
+        except RuntimeError:
+            # No loop (tests, or a save during shutdown) -- write synchronously.
+            _write_task = None
+            log.debug("No running loop; skipping async key-value write")
+
+
+async def _drain_writes() -> None:
+    global _pending_payload
+    while _pending_payload is not None:
+        payload, _pending_payload = _pending_payload, None
+        for attempt in range(REDIS_WRITE_RETRIES):
+            try:
+                await _redis.set(REDIS_KEY, payload)
+                break
+            except Exception:
+                if attempt == REDIS_WRITE_RETRIES - 1:
+                    log.exception("Could not save availability to the key-value store")
+                else:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+
+async def storage_init() -> None:
+    """Connect to the Key Value store and load availability into memory.
+
+    Falls back to the local JSON file when no store is configured, so running
+    the bot on your own machine needs no extra setup.
+    """
+    global _redis, _cache, _cache_stamp, _last_prune
+
+    if not REDIS_URL:
+        log.info("No key-value store configured; using %s", DATA_FILE)
+        return
+
+    try:
+        import redis.asyncio as redis_async
+    except ImportError:
+        log.error("REDIS_URL is set but the 'redis' package isn't installed; falling back to %s", DATA_FILE)
+        return
+
+    try:
+        client = redis_async.from_url(REDIS_URL, decode_responses=True)
+        await client.ping()
+    except Exception:
+        log.exception("Could not reach the key-value store; falling back to %s", DATA_FILE)
+        return
+
+    _redis = client
+    _last_prune = time.monotonic()
+
+    raw_text = None
+    from_store = True
+    try:
+        raw_text = await _redis.get(REDIS_KEY)
+    except Exception:
+        log.exception("Could not read availability from the key-value store")
+
+    if not raw_text:
+        # First run against an empty store: adopt any local file so existing
+        # availability carries over instead of silently starting from scratch.
+        from_store = False
+        try:
+            raw_text = DATA_FILE.read_text(encoding="utf-8")
+            log.info("Key-value store was empty; seeding it from %s", DATA_FILE)
+        except OSError:
+            raw_text = None
+
+    parsed: dict = {}
+    if raw_text:
+        try:
+            loaded = json.loads(raw_text)
+            if isinstance(loaded, dict):
+                parsed = loaded
+            else:
+                raise ValueError("stored value is not a JSON object")
+        except (json.JSONDecodeError, ValueError):
+            log.exception("Stored availability was unreadable; keeping a copy under %s.corrupt", REDIS_KEY)
+            try:
+                await _redis.set(f"{REDIS_KEY}.corrupt", raw_text)
+            except Exception:
+                log.warning("Could not stash the unreadable value")
+
+    data, _ = _normalise(parsed)
+    _cache, _cache_stamp = data, None
+    log.info("Loaded %d member(s) from the key-value store", len(data))
+
+    # Write back whenever the store doesn't already hold exactly this — covers
+    # seeding from a local file, migrating an older shape, and pruning.
+    serialised = json.dumps(data, indent=2)
+    if not from_store or serialised != raw_text:
+        _queue_redis_write(serialised)
+
+
+async def storage_close() -> None:
+    """Flush any queued write, then close the connection."""
+    if _redis is None:
+        return
+    if _write_task is not None and not _write_task.done():
+        try:
+            await asyncio.wait_for(_write_task, timeout=10)
+        except (asyncio.TimeoutError, Exception):
+            log.warning("Timed out flushing the final availability write")
+    if _pending_payload is not None:
+        await _drain_writes()
+    try:
+        await _redis.aclose()
+    except Exception:
+        pass
+
 
 def _file_stamp() -> tuple[int, int] | None:
     try:
@@ -191,14 +336,37 @@ def _file_stamp() -> tuple[int, int] | None:
     return (stat.st_mtime_ns, stat.st_size)
 
 
+def _normalise(raw: dict) -> tuple[dict, bool]:
+    """Migrate every record to the current shape and drop expired entries."""
+    data = {str(uid): _migrate_record(rec) for uid, rec in raw.items() if isinstance(rec, dict)}
+    data = {uid: rec for uid, rec in data.items() if rec["avail"]}
+    pruned = _prune_expired(data)
+    if pruned:
+        log.info("Pruned availability older than %s", AVAILABILITY_TTL)
+    return data, pruned
+
+
 def load_data() -> dict:
-    """Read, migrate and prune the availability file.
+    """Read, migrate and prune the availability data.
 
     Returns a private copy: callers mutate what they get back, and that must
-    not corrupt the cache. Never raises on a missing or corrupt file -- a bad
-    file is set aside so a stray character can't take every command down.
+    not corrupt the cache. Never raises -- corrupt storage is set aside so a
+    stray character can't take every command down.
     """
-    global _cache, _cache_stamp
+    global _cache, _cache_stamp, _last_prune
+
+    if _redis is not None:
+        # Key Value backed: this process is the only writer, so the in-memory
+        # copy stays authoritative between saves. It's filled by storage_init().
+        if _cache is None:
+            return {}
+        # Nothing re-reads storage here, so sweep expiries on a timer instead.
+        if time.monotonic() - _last_prune > PRUNE_INTERVAL:
+            _last_prune = time.monotonic()
+            if _prune_expired(_cache):
+                log.info("Pruned availability older than %s", AVAILABILITY_TTL)
+                _queue_redis_write(json.dumps(_cache, indent=2))
+        return copy.deepcopy(_cache)
 
     stamp = _file_stamp()
     if stamp is None:  # no file yet
@@ -222,10 +390,7 @@ def load_data() -> dict:
         _cache, _cache_stamp = {}, None
         return {}
 
-    data = {str(uid): _migrate_record(rec) for uid, rec in raw.items() if isinstance(rec, dict)}
-    data = {uid: rec for uid, rec in data.items() if rec["avail"]}
-    if _prune_expired(data):
-        log.info("Pruned availability older than %s", AVAILABILITY_TTL)
+    data, _ = _normalise(raw)
 
     # Only write when migrating or pruning actually changed something. Writing
     # on every read is what previously made commands slow enough to time out.
@@ -237,17 +402,24 @@ def load_data() -> dict:
 
 
 def save_data(data: dict) -> None:
-    """Persist the availability file, then refresh the in-memory cache.
+    """Persist availability, then refresh the in-memory cache.
 
-    Prefers an atomic temp-file swap, but Windows raises PermissionError
-    (WinError 5) from os.replace whenever the destination is momentarily
-    locked -- OneDrive, antivirus and open editors all do this on a synced
-    folder like Desktop. So we retry briefly, then fall back to writing in
-    place, which is less safe but far better than losing the save.
+    With a Key Value store the write is queued and flushed on the event loop so
+    a slash command never waits on the network. Otherwise it goes to disk,
+    preferring an atomic temp-file swap -- Windows raises PermissionError
+    (WinError 5) from os.replace whenever the destination is momentarily locked
+    (OneDrive, antivirus, open editors), so we retry then write in place, which
+    is less safe but far better than losing the save.
     """
     global _cache, _cache_stamp
 
     payload = json.dumps(data, indent=2)
+
+    if _redis is not None:
+        _cache, _cache_stamp = copy.deepcopy(data), None
+        _queue_redis_write(payload)
+        return
+
     tmp = DATA_FILE.with_suffix(".tmp")
     try:
         tmp.write_text(payload, encoding="utf-8")
@@ -278,6 +450,12 @@ SECRET_FILE = Path(__file__).resolve().parent / ".dashboard_secret"
 
 
 def _load_secret() -> bytes:
+    """Key for signing edit links.
+
+    Prefer DASHBOARD_SECRET from the environment: hosts like Render give each
+    deploy a fresh filesystem, so a secret written to disk would change on every
+    deploy and invalidate everyone's saved edit links.
+    """
     from_env = os.environ.get("DASHBOARD_SECRET")
     if from_env:
         return from_env.encode()
@@ -288,7 +466,13 @@ def _load_secret() -> bytes:
         try:
             SECRET_FILE.write_bytes(value)
         except OSError:
-            log.warning("Could not save %s; edit links will stop working on restart", SECRET_FILE)
+            pass
+        if PUBLIC_URL:
+            log.warning(
+                "DASHBOARD_SECRET is not set. On a hosted deploy the generated key does not "
+                "survive a restart, so every /editlink URL will stop working. Set it as an "
+                "environment variable."
+            )
         return value
 
 
@@ -824,7 +1008,7 @@ class MonthNavButton(discord.ui.Button):
         self.delta = delta  # None = refresh in place, 0 = jump to today
 
     async def callback(self, interaction: discord.Interaction):
-        view: MonthView = self.view
+        view = cast(MonthView, self.view)
         if self.delta == 0:
             now = datetime.now(TZ)
             view.year, view.month = now.year, now.month
@@ -965,7 +1149,7 @@ async def send_embed(interaction: discord.Interaction, embed: discord.Embed, *, 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-_dashboard_runner = None  # set once the web dashboard binds; see on_ready
+_dashboard_runner = None  # set once the web dashboard binds; see main()
 
 # Scheduled events change rarely but were being re-fetched from Discord on every
 # dashboard poll (every 15s, per guild) and every /month or /events press, which
@@ -1002,7 +1186,7 @@ async def fetch_events(
     """
     cached = _events_cache.get(guild.id)
     fresh = cached is not None and time.monotonic() - cached[0] < EVENTS_TTL
-    if not force and fresh:
+    if not force and fresh and cached is not None:
         return cached[1]
 
     if allow_stale and cached is not None and not force:
@@ -1013,7 +1197,6 @@ async def fetch_events(
 
     _refreshing.add(guild.id)
     return await _refresh_events(guild)
-_tunnel: PublicTunnel | None = None  # set on first /dashboard call; see the command
 
 
 # ---------- availability UI ----------
@@ -1193,7 +1376,7 @@ class SlotSelect(discord.ui.Select):
         super().__init__(placeholder="Pick a window to schedule…", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
-        view: ScheduleFromBestView = self.view
+        view = cast(ScheduleFromBestView, self.view)
         view.choose(int(self.values[0]))
         await interaction.response.edit_message(embed=view.summary(), view=view)
 
@@ -1219,7 +1402,7 @@ class DurationSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        view: ScheduleFromBestView = self.view
+        view = cast(ScheduleFromBestView, self.view)
         view.duration_hours = int(self.values[0])
         view.rebuild()
         await interaction.response.edit_message(embed=view.summary(), view=view)
@@ -1230,10 +1413,17 @@ class CreateEventButton(discord.ui.Button):
         super().__init__(label="Create Discord event", style=discord.ButtonStyle.green, row=2)
 
     async def callback(self, interaction: discord.Interaction):
-        view: ScheduleFromBestView = self.view
+        view = cast(ScheduleFromBestView, self.view)
         if view.chosen is None:
             await interaction.response.send_message(
                 embed=base_embed("Pick a window", "Choose one of the time windows above first.", COLOR_WARN),
+                ephemeral=True,
+            )
+            return
+
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                embed=base_embed("Server only", "Events can only be created inside a server.", COLOR_WARN),
                 ephemeral=True,
             )
             return
@@ -1256,7 +1446,8 @@ class CreateEventButton(discord.ui.Button):
             return
 
         view.disable_all()
-        await interaction.message.edit(view=view)
+        if interaction.message is not None:
+            await interaction.message.edit(view=view)
         await interaction.followup.send(embed=event_created_embed(event, block["people"]))
         view.stop()
 
@@ -1288,6 +1479,8 @@ class ScheduleFromBestView(discord.ui.View):
         self.add_item(CreateEventButton())
 
     def summary(self) -> discord.Embed:
+        # Only ever called once a window has been picked.
+        assert self.chosen is not None
         block = self.blocks[self.chosen]
         start = (
             window_start(block["date"], block["start"])
@@ -1318,7 +1511,8 @@ class ScheduleFromBestView(discord.ui.View):
 
     def disable_all(self) -> None:
         for item in self.children:
-            item.disabled = True
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                item.disabled = True
 
 
 # ---------- dashboard state ----------
@@ -1419,20 +1613,9 @@ async def on_ready():
         log.info("Commands synced globally (can take up to an hour to appear)")
     log.info("Logged in as %s", bot.user)
 
-    # Guarded so a reconnect (on_ready fires again) doesn't double-bind the port.
-    global _dashboard_runner
     # Warm the event cache now so the first dashboard visit doesn't pay for it.
     for guild in bot.guilds:
         asyncio.create_task(_refresh_events(guild))
-
-    if DASHBOARD_ENABLED and _dashboard_runner is None:
-        _dashboard_runner = await start_dashboard(
-            dashboard_state,
-            DASHBOARD_HOST,
-            DASHBOARD_PORT,
-            get_user=dashboard_get_user,
-            save_user=dashboard_save_user,
-        )
 
 
 @bot.event
@@ -1509,24 +1692,6 @@ async def my_availability(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-async def ensure_tunnel() -> PublicTunnel:
-    """Start the public tunnel if it isn't up yet, then wait briefly for its URL.
-
-    Lazy so a bot nobody shares links from never spawns cloudflared at all.
-    """
-    global _tunnel
-    if _tunnel is None:
-        _tunnel = PublicTunnel(DASHBOARD_PORT)
-        _tunnel.start()
-    # Quick tunnels typically hand back a URL in 1-3 seconds; wait a little
-    # rather than immediately telling the user it isn't ready.
-    for _ in range(20):
-        if _tunnel.url or _tunnel.error:
-            break
-        await asyncio.sleep(0.25)
-    return _tunnel
-
-
 @bot.tree.command(name="editlink", description="Get your private link for editing your availability on the web")
 async def editlink(interaction: discord.Interaction):
     if _dashboard_runner is None:
@@ -1536,11 +1701,7 @@ async def editlink(interaction: discord.Interaction):
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
-    tunnel = await ensure_tunnel()
-    base = tunnel.url or f"http://localhost:{DASHBOARD_PORT}"
-    url = f"{base}/?key={make_edit_token(str(interaction.user.id))}#me"
-
+    url = f"{public_base_url()}/?key={make_edit_token(str(interaction.user.id))}#me"
     embed = base_embed(
         "Your private edit link",
         f"Open this to set your free hours on the web:\n**{url}**",
@@ -1552,13 +1713,13 @@ async def editlink(interaction: discord.Interaction):
         "change your hours — share the plain `/dashboard` link instead if you just want someone to look.",
         inline=False,
     )
-    if not tunnel.url:
+    if not PUBLIC_URL:
         embed.add_field(
             name="Note",
-            value="No public tunnel is running, so this link only works on the computer hosting the bot.",
+            value="No public address is configured, so this link only works on the computer running the bot.",
             inline=False,
         )
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="dashboard", description="Get a link to the web dashboard, viewable by anyone")
@@ -1570,43 +1731,23 @@ async def dashboard(interaction: discord.Interaction):
         )
         return
 
-    global _tunnel
-
-    await interaction.response.defer()
-    tunnel = await ensure_tunnel()
-
-    if tunnel.url:
-        embed = base_embed(
-            "Web dashboard",
-            f"Anyone with this link can view it — no sign-in required:\n**{tunnel.url}**",
-            COLOR_OK,
-        )
+    embed = base_embed(
+        "Web dashboard",
+        f"Anyone with this link can view it — no sign-in required:\n**{public_base_url()}**",
+        COLOR_OK,
+    )
+    embed.add_field(
+        name="Heads up",
+        value="This shows the whole team's names and availability to anyone who has the link.",
+        inline=False,
+    )
+    if not PUBLIC_URL:
         embed.add_field(
-            name="Heads up",
-            value="This shows the whole team's names and availability to anyone who has the link.\n"
-            "Give it a few seconds to start working — the address takes a moment to go live.",
+            name="Note",
+            value="No public address is configured, so this link only works on the computer running the bot.",
             inline=False,
         )
-    elif tunnel.error == "cloudflared-missing":
-        embed = base_embed(
-            "Public link needs one extra file",
-            "To make `/dashboard` work from anywhere, download **cloudflared** "
-            f"and put `cloudflared.exe` in this bot's folder, then run `/dashboard` again:\n{CLOUDFLARED_RELEASE}",
-            COLOR_WARN,
-        )
-        embed.add_field(
-            name="Just testing on this computer?",
-            value=f"Open **http://localhost:{DASHBOARD_PORT}** directly instead.",
-            inline=False,
-        )
-    else:
-        embed = error_embed(
-            f"Couldn't set up the public link ({tunnel.error or 'still starting'}). "
-            f"You can still open **http://localhost:{DASHBOARD_PORT}** on this computer."
-        )
-        _tunnel = None  # let the next /dashboard call try again from scratch
-
-    await interaction.followup.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="month", description="Month calendar you can page through to see events in advance")
@@ -1730,7 +1871,7 @@ async def status(interaction: discord.Interaction):
         )
         embed.add_field(name=record["name"], value=summary or "—", inline=False)
     if len(records) > 25:
-        embed.description += f"\n*Showing the first 25 of {len(records)}.*"
+        embed.description = (embed.description or "") + f"\n*Showing the first 25 of {len(records)}.*"
     await interaction.response.send_message(embed=embed)
 
 
@@ -1777,10 +1918,14 @@ async def best(interaction: discord.Interaction, top: app_commands.Range[int, 1,
             inline=False,
         )
 
-    view = ScheduleFromBestView(blocks, total_people) if interaction.guild else None
-    if view:
+    # MISSING rather than None: discord.py's sentinel for "no view supplied".
+    view: discord.ui.View = discord.utils.MISSING
+    if interaction.guild:
+        view = ScheduleFromBestView(blocks, total_people)
         who = " / ".join(SCHEDULE_ROLE_NAMES) or "Anyone"
-        embed.description += f"\n\n*{who} can pick a slot below to turn it into a Discord event.*"
+        embed.description = (embed.description or "") + (
+            f"\n\n*{who} can pick a slot below to turn it into a Discord event.*"
+        )
     await interaction.response.send_message(embed=embed, view=view)
 
 
@@ -1792,9 +1937,11 @@ async def best(interaction: discord.Interaction, top: app_commands.Range[int, 1,
     title="Event title (default 'FTC Team Meeting')",
     location="Where the meeting happens",
 )
+# Split across two decorators: choices() binds a single type variable per call,
+# so str choices and int choices can't share one invocation.
+@app_commands.choices(day=[app_commands.Choice(name=d, value=d) for d in DAYS])
 @app_commands.choices(
-    day=[app_commands.Choice(name=d, value=d) for d in DAYS],
-    hour=[app_commands.Choice(name=HOUR_LABELS[i], value=i) for i in range(len(HOUR_LABELS))],
+    hour=[app_commands.Choice(name=HOUR_LABELS[i], value=i) for i in range(len(HOUR_LABELS))]
 )
 async def schedule(
     interaction: discord.Interaction,
@@ -1837,10 +1984,41 @@ async def schedule(
     await interaction.followup.send(embed=event_created_embed(event, attendees))
 
 
+async def run_bot() -> None:
+    """Bind the web port first, then connect to Discord.
+
+    Render health-checks the port shortly after boot and will mark the deploy
+    failed if nothing is listening, so the dashboard must not wait on the
+    Discord login to finish.
+    """
+    global _dashboard_runner
+    await storage_init()
+    if DASHBOARD_ENABLED:
+        _dashboard_runner = await start_dashboard(
+            dashboard_state,
+            DASHBOARD_HOST,
+            DASHBOARD_PORT,
+            get_user=dashboard_get_user,
+            save_user=dashboard_save_user,
+        )
+    try:
+        await bot.start(cast(str, TOKEN))
+    finally:
+        # Flush the last save before the process goes away.
+        await storage_close()
+        if _dashboard_runner is not None:
+            await _dashboard_runner.cleanup()
+
+
 def main() -> None:
     if not TOKEN:
-        raise SystemExit("DISCORD_BOT_TOKEN is not set. Put it in a .env file next to bot.py.")
-    bot.run(TOKEN)
+        raise SystemExit("DISCORD_BOT_TOKEN is not set. Set it in .env locally, or as an environment variable.")
+    if PUBLIC_URL:
+        log.info("Public dashboard URL: %s", PUBLIC_URL)
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        log.info("Shutting down")
 
 
 if __name__ == "__main__":
