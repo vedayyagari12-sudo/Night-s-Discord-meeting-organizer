@@ -1,0 +1,863 @@
+"""A live web dashboard for the meeting organizer.
+
+Runs inside the bot's own asyncio loop on aiohttp, which discord.py already
+depends on, so there is nothing extra to install. The page is a single
+self-contained document; it polls /api/state for fresh data.
+
+Binds to localhost by default -- the payload contains team members' names, so
+it is not something to put on an open port without thinking about it first.
+"""
+
+from __future__ import annotations
+
+import atexit
+import logging
+import os
+import re
+import shutil
+import subprocess
+import threading
+from pathlib import Path
+from typing import Awaitable, Callable
+
+from aiohttp import web
+
+log = logging.getLogger("meetingbot.dashboard")
+
+StateProvider = Callable[[], Awaitable[dict]]
+
+CLOUDFLARED_URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+CLOUDFLARED_RELEASE = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+
+
+def find_cloudflared() -> str | None:
+    """Locate the cloudflared binary: an env override, PATH, or next to this file.
+
+    The official download is named cloudflared-windows-amd64.exe, so match any
+    cloudflared*.exe rather than making people rename the file first.
+    """
+    override = os.environ.get("CLOUDFLARED_PATH")
+    if override and Path(override).exists():
+        return override
+    on_path = shutil.which("cloudflared")
+    if on_path:
+        return on_path
+    folder = Path(__file__).resolve().parent
+    for candidate in sorted(folder.glob("cloudflared*.exe")):
+        return str(candidate)
+    return None
+
+
+def kill_stray_tunnels() -> int:
+    """Terminate cloudflared processes left over from earlier bot runs.
+
+    Only touches processes named cloudflared*, and only on Windows where
+    taskkill is available; failures here are never fatal.
+    """
+    if os.name != "nt":
+        return 0
+    try:
+        result = subprocess.run(
+            ["taskkill", "/F", "/IM", "cloudflared*"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    killed = result.stdout.count("SUCCESS")
+    if killed:
+        log.info("Cleaned up %d leftover cloudflared process(es)", killed)
+    return killed
+
+
+class PublicTunnel:
+    """A `cloudflared tunnel --url ...` quick tunnel, run as a plain subprocess.
+
+    Quick tunnels need no account or token: cloudflared connects out to
+    Cloudflare's edge and gets back a random *.trycloudflare.com hostname that
+    forwards to our local port. Using plain subprocess + a background thread
+    (rather than asyncio subprocess) sidesteps Windows event-loop quirks with
+    piped subprocess I/O and keeps cleanup working via atexit even if the bot
+    is killed abruptly.
+    """
+
+    def __init__(self, port: int):
+        self.port = port
+        self.url: str | None = None
+        self.error: str | None = None
+        self.process: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        binary = find_cloudflared()
+        if not binary:
+            self.error = "cloudflared-missing"
+            return
+        # Killing the bot's console window skips atexit, so tunnels from earlier
+        # runs survive and pile up. Clear them before starting another.
+        kill_stray_tunnels()
+        try:
+            self.process = subprocess.Popen(
+                [binary, "tunnel", "--url", f"http://127.0.0.1:{self.port}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except OSError as exc:
+            self.error = str(exc)
+            return
+        threading.Thread(target=self._watch, daemon=True).start()
+        atexit.register(self.stop)
+
+    def _watch(self) -> None:
+        assert self.process and self.process.stdout
+        for line in self.process.stdout:
+            if not self.url:
+                match = CLOUDFLARED_URL_RE.search(line)
+                if match:
+                    self.url = match.group(0)
+                    log.info("Public dashboard link ready: %s", self.url)
+        # stdout closing means the child is finishing; wait() reaps it so the
+        # return code is actually available (poll() can still read None here).
+        self.process.wait()
+        if not self.url:
+            self.error = "exited"
+            log.warning("cloudflared exited (code %s) before producing a tunnel URL", self.process.returncode)
+
+    def stop(self) -> None:
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+
+PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FTC Meeting Organizer</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :root {
+    --bg: #0d1017; --panel: #151a23; --panel-2: #1b2230; --line: #252d3b;
+    --text: #e6ecf5; --muted: #8b97ab; --accent: #f5c518; --accent-2: #a855f7;
+    --blue: #38bdf8; --green: #34d399; --rose: #fb7185; --orange: #fb923c;
+    --radius: 14px;
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); overflow: hidden;
+    font: 15px/1.5 "Segoe UI", Inter, system-ui, -apple-system, sans-serif;
+  }
+  .app { display: grid; grid-template-columns: 250px 1fr; height: 100vh; }
+
+  /* ---------- sidebar ---------- */
+  .side {
+    background: var(--panel); border-right: 1px solid var(--line);
+    padding: 22px 16px; display: flex; flex-direction: column; gap: 26px;
+    overflow-y: auto;
+  }
+  .brand { display: flex; align-items: center; gap: 11px; }
+  .brand .dot {
+    width: 34px; height: 34px; border-radius: 10px; flex: none;
+    background: linear-gradient(135deg, var(--accent), var(--orange));
+    display: grid; place-items: center; font-size: 18px;
+  }
+  .brand h1 { font-size: 15px; margin: 0; line-height: 1.25; }
+  .brand span { color: var(--muted); font-size: 12px; }
+
+  .sect { display: flex; flex-direction: column; gap: 6px; }
+  .sect > .label {
+    color: var(--muted); font-size: 11px; letter-spacing: .09em;
+    text-transform: uppercase; padding: 0 10px 4px;
+  }
+  .nav {
+    display: flex; align-items: center; gap: 10px; padding: 9px 11px;
+    border-radius: 9px; cursor: pointer; color: var(--muted);
+    border: 1px solid transparent; font-size: 14px; text-align: left;
+    background: none; width: 100%; font-family: inherit;
+  }
+  .nav:hover { background: var(--panel-2); color: var(--text); }
+  .nav.on { background: var(--panel-2); color: var(--text); border-color: var(--line); }
+  .nav .ic { width: 18px; text-align: center; }
+
+  .stats { display: grid; gap: 9px; }
+  .stat {
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 11px; padding: 11px 13px;
+  }
+  .stat b { display: block; font-size: 21px; line-height: 1.2; }
+  .stat span { color: var(--muted); font-size: 11.5px; }
+
+  /* ---------- main ---------- */
+  .main { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+  .top {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 16px 26px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  .top h2 { margin: 0; font-size: 21px; min-width: 190px; }
+  .btn {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 9px; padding: 7px 13px; cursor: pointer;
+    font-size: 13.5px; font-family: inherit;
+  }
+  .btn:hover { border-color: var(--muted); }
+  .btn.pri { background: var(--accent); color: #1a1400; border-color: transparent; font-weight: 600; }
+  .spacer { flex: 1; }
+  .live { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 7px; }
+  .pulse {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+
+  .scroll { overflow: auto; padding: 22px 26px 34px; flex: 1; }
+  .view { display: none; }
+  .view.on { display: block; }
+
+  /* ---------- month calendar ---------- */
+  .dow {
+    display: grid; grid-template-columns: repeat(7, 1fr); gap: 9px;
+    margin-bottom: 9px;
+  }
+  .dow div {
+    color: var(--muted); font-size: 11.5px; letter-spacing: .07em;
+    text-transform: uppercase; text-align: center; padding-bottom: 2px;
+  }
+  .grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 9px; }
+  .cell {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    min-height: 116px; padding: 9px 10px; display: flex; flex-direction: column; gap: 6px;
+    position: relative; overflow: hidden;
+  }
+  .cell.pad { background: transparent; border-color: transparent; }
+  .cell.today { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .cell .n { font-size: 13.5px; color: var(--muted); font-weight: 600; }
+  .cell.today .n { color: var(--accent); }
+  .cell .heat {
+    position: absolute; inset: auto 0 0 0; height: 3px; background: var(--green);
+  }
+  .chip {
+    background: var(--panel-2); border-left: 3px solid var(--accent);
+    border-radius: 6px; padding: 4px 7px; font-size: 11.5px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .chip.p { border-left-color: var(--green); color: var(--muted); }
+  .chip time { color: var(--muted); font-size: 10.5px; display: block; }
+  .cell .more { color: var(--muted); font-size: 10.5px; }
+
+  /* ---------- heatmap ---------- */
+  .heatwrap { overflow-x: auto; }
+  .hm { border-collapse: separate; border-spacing: 5px; min-width: 560px; width: 100%; }
+  .hm th { color: var(--muted); font-size: 11.5px; font-weight: 500; text-transform: uppercase; }
+  .hm th.row { text-align: right; padding-right: 8px; white-space: nowrap; width: 96px; }
+  .hm td {
+    border-radius: 8px; height: 42px; text-align: center; font-size: 13px;
+    background: var(--panel); border: 1px solid var(--line); font-variant-numeric: tabular-nums;
+  }
+  .hm td.z { color: #3a4557; }
+  .hm td.best { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  /* ---------- lists ---------- */
+  /* align-items:start so a tall card doesn't stretch its whole row */
+  .cards {
+    display: grid; gap: 11px; align-items: start;
+    grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent);
+    border-radius: var(--radius); padding: 13px 15px;
+  }
+  .card h4 { margin: 0 0 5px; font-size: 15px; }
+  .card .meta { color: var(--muted); font-size: 12.5px; }
+  .card .who { color: var(--muted); font-size: 12px; margin-top: 7px; line-height: 1.45; }
+  .rank { float: right; font-size: 17px; }
+  .empty { color: var(--muted); text-align: center; padding: 56px 20px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+
+  /* ---------- best-times cards ---------- */
+  .bcard {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 14px 16px;
+  }
+  .bcard.win { border-color: var(--accent); background: linear-gradient(180deg, rgba(245,197,24,.07), transparent); }
+  .bhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  .bwhen { font-size: 15.5px; font-weight: 650; }
+  .btime { color: var(--accent); font-size: 13.5px; font-weight: 600; margin-top: 1px; }
+  .bcount { text-align: right; line-height: 1.15; }
+  .bcount b { font-size: 20px; }
+  .bcount b span { color: var(--muted); font-size: 13px; font-weight: 500; }
+  .bcount > span { display: block; color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+  .bbar { height: 5px; border-radius: 3px; background: var(--panel-2); margin: 11px 0 9px; overflow: hidden; }
+  .bbar i { display: block; height: 100%; background: var(--green); border-radius: 3px; }
+  .bfoot { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  .pill {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+    border-radius: 999px; padding: 2px 9px; font-size: 11.5px; white-space: nowrap;
+  }
+  .bfoot .who { color: var(--muted); font-size: 12.5px; margin: 0; }
+  .cards.dim .bcard { opacity: .62; }
+  .cards.dim .btime { color: var(--muted); }
+
+  /* ---------- season calendar ---------- */
+  .months { display: grid; gap: 22px; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); }
+  .mon { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
+  .mon h4 { margin: 0 0 10px; font-size: 14.5px; }
+  .mgrid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+  .mgrid .dh { color: var(--muted); font-size: 10px; text-align: center; text-transform: uppercase; }
+  .mday {
+    aspect-ratio: 1; border-radius: 7px; display: grid; place-items: center;
+    font-size: 12px; background: var(--panel-2); color: var(--muted);
+    border: 1px solid transparent; position: relative;
+  }
+  .mday.pad { background: transparent; }
+  .mday.today { border-color: var(--accent); color: var(--accent); font-weight: 700; }
+  .mday.has { color: #06281d; font-weight: 650; }
+  .mday.ev::after {
+    content: ""; position: absolute; bottom: 3px; width: 4px; height: 4px;
+    border-radius: 50%; background: var(--accent);
+  }
+
+  /* ---------- personal editor ---------- */
+  .namebar { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+  .namebar input {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 9px; padding: 8px 12px; font: inherit; font-size: 14px; min-width: 220px;
+  }
+  .namebar input:focus { outline: none; border-color: var(--accent); }
+  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .offday { cursor: pointer; }
+  .offday.off { background: var(--rose); color: #2b0710; font-weight: 700; }
+  .ed td { cursor: pointer; user-select: none; transition: background .08s; }
+  .ed td:hover { border-color: var(--muted); }
+  .ed td.on { background: var(--green); color: #06281d; font-weight: 700; border-color: transparent; }
+  .ed th.col { cursor: pointer; }
+  .ed th.col:hover { color: var(--text); text-decoration: underline; }
+  .savebar { display: flex; align-items: center; gap: 11px; margin-top: 18px; flex-wrap: wrap; }
+  .savebar .hint { margin: 0; }
+  h3.sec { font-size: 13px; color: var(--muted); text-transform: uppercase;
+           letter-spacing: .08em; margin: 26px 0 11px; }
+  h3.sec:first-child { margin-top: 0; }
+
+  @media (max-width: 820px) {
+    .app { grid-template-columns: 1fr; }
+    .side { display: none; }
+    .cell { min-height: 82px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="dot">🤖</div>
+      <div><h1>Meeting Organizer</h1><span id="tz">—</span></div>
+    </div>
+
+    <div class="sect">
+      <div class="label">Views</div>
+      <button class="nav" data-view="me" id="nav-me" hidden><span class="ic">✏️</span> My availability</button>
+      <button class="nav on" data-view="cal"><span class="ic">📅</span> Calendar</button>
+      <button class="nav" data-view="season"><span class="ic">🗓️</span> Season</button>
+      <button class="nav" data-view="heat"><span class="ic">📊</span> Weekly pattern</button>
+      <button class="nav" data-view="best"><span class="ic">⭐</span> Best times</button>
+      <button class="nav" data-view="team"><span class="ic">👥</span> Team</button>
+    </div>
+
+    <div class="sect">
+      <div class="label">At a glance</div>
+      <div class="stats">
+        <div class="stat"><b id="s-people">0</b><span>members submitted</span></div>
+        <div class="stat"><b id="s-events">0</b><span>upcoming events</span></div>
+        <div class="stat"><b id="s-best">—</b><span id="s-best-sub">best slot</span></div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <h2 id="title">Loading…</h2>
+      <button class="btn" id="prev">‹</button>
+      <button class="btn pri" id="today">Today</button>
+      <button class="btn" id="next">›</button>
+      <div class="spacer"></div>
+      <div class="live"><span class="pulse"></span><span id="upd">connecting…</span></div>
+    </div>
+
+    <div class="scroll">
+      <section class="view on" id="v-cal">
+        <div class="dow"><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div>
+                         <div>Fri</div><div>Sat</div><div>Sun</div></div>
+        <div class="grid" id="grid"></div>
+      </section>
+      <section class="view" id="v-season"><div class="months" id="months"></div></section>
+      <section class="view" id="v-me">
+        <div class="namebar">
+          <label for="myname">Display name</label>
+          <input id="myname" maxlength="32" placeholder="Your name">
+        </div>
+        <div class="tabs">
+          <button class="btn pri" id="tab-week">Weekly hours</button>
+          <button class="btn" id="tab-off">Days I'm away</button>
+        </div>
+        <p class="hint" id="me-hint"></p>
+        <div id="pane-week"><div class="heatwrap"><table class="hm ed" id="ed"></table></div></div>
+        <div id="pane-off" hidden><div class="months" id="offmonths"></div></div>
+        <div class="savebar">
+          <button class="btn pri" id="save">Save</button>
+          <button class="btn" id="clearall">Clear weekly hours</button>
+          <span id="savemsg" class="hint"></span>
+        </div>
+      </section>
+      <section class="view" id="v-heat"><div class="heatwrap"><table class="hm" id="hm"></table></div></section>
+      <section class="view" id="v-best"><div id="best"></div></section>
+      <section class="view" id="v-team"><div class="cards" id="team"></div></section>
+    </div>
+  </main>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const ACCENTS = ["#f5c518", "#a855f7", "#38bdf8", "#34d399", "#fb7185", "#fb923c"];
+const MONTHS = ["January","February","March","April","May","June","July",
+                "August","September","October","November","December"];
+let state = null;
+let cursor = new Date();   // which month the calendar is showing
+let view = "cal";
+
+const hue = (s) => ACCENTS[Math.abs([...String(s)].reduce((a,c)=>a+c.charCodeAt(0),0)) % ACCENTS.length];
+const clock = (iso) => new Date(iso).toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
+const ymd = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+
+const VIEWS = ["cal", "season", "heat", "best", "team", "me"];
+// Present only on a personal edit link; the plain public URL has no key and
+// therefore never gets the editor.
+const KEY = new URLSearchParams(location.search).get("key");
+let mine = null;
+let mePane = "week";
+
+function setView(v, push) {
+  view = VIEWS.includes(v) ? v : "cal";
+  document.querySelectorAll(".nav").forEach(n => n.classList.toggle("on", n.dataset.view === view));
+  document.querySelectorAll(".view").forEach(s => s.classList.toggle("on", s.id === "v-" + view));
+  ["prev","today","next"].forEach(id => $(id).style.display = view === "cal" ? "" : "none");
+  if (push) location.hash = view;   // deep-linkable, and survives a refresh
+  render();
+}
+
+function render() {
+  if (!state) return;
+  $("tz").textContent = state.timezone;
+  $("s-people").textContent = state.totalPeople;
+  $("s-events").textContent = state.events.length;
+  const top = state.best[0];
+  $("s-best").textContent = top ? `${top.count}/${state.totalPeople}` : "—";
+  $("s-best-sub").textContent = top ? `${top.day} ${top.label}` : "no data yet";
+
+  if (view === "cal") renderMonth();
+  else if (view === "season") renderSeason();
+  else if (view === "heat") renderHeat();
+  else if (view === "best") renderBest();
+  else if (view === "me") renderMe();
+  else renderTeam();
+}
+
+const iso = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+
+// One month block, shared by the season overview and the days-off picker.
+function monthBlock(y, m, cell) {
+  const first = new Date(y, m, 1);
+  const lead = (first.getDay() + 6) % 7;
+  const days = new Date(y, m + 1, 0).getDate();
+  let g = ["M","T","W","T","F","S","S"].map(d => `<div class="dh">${d}</div>`).join("");
+  for (let i = 0; i < lead; i++) g += `<div class="mday pad"></div>`;
+  for (let d = 1; d <= days; d++) g += cell(new Date(y, m, d), d);
+  return `<div class="mon"><h4>${MONTHS[m]} ${y}</h4><div class="mgrid">${g}</div></div>`;
+}
+
+// Every month from today through the end of the season.
+function seasonMonths() {
+  const start = new Date(state.today + "T12:00:00");
+  const end = new Date(state.seasonEnd + "T12:00:00");
+  const out = [];
+  let y = start.getFullYear(), m = start.getMonth();
+  while (y < end.getFullYear() || (y === end.getFullYear() && m <= end.getMonth())) {
+    out.push([y, m]);
+    if (++m > 11) { m = 0; y++; }
+  }
+  return out;
+}
+
+function renderSeason() {
+  $("title").textContent = "Season at a glance";
+  const totals = state.dayTotals || {};
+  const peak = Math.max(1, ...Object.values(totals).map(t => t.peak));
+  const evDays = new Set(state.events.map(e => iso(new Date(e.start))));
+  $("months").innerHTML = seasonMonths().map(([y, m]) => monthBlock(y, m, (date, d) => {
+    const key = iso(date);
+    const t = totals[key];
+    const cls = ["mday"];
+    if (key === state.today) cls.push("today");
+    if (t) cls.push("has");
+    if (evDays.has(key)) cls.push("ev");
+    const bg = t ? `background:rgba(52,211,153,${(0.18 + 0.72 * t.peak / peak).toFixed(2)});` : "";
+    const tip = t ? `${t.peak}/${state.totalPeople} free · ${t.label}` : "nobody free";
+    return `<div class="${cls.join(" ")}" style="${bg}" title="${key} — ${tip}">${d}</div>`;
+  })).join("");
+}
+
+async function loadMine() {
+  if (!KEY) return;
+  $("nav-me").hidden = false;
+  try {
+    const r = await fetch("/api/me?key=" + encodeURIComponent(KEY), {cache: "no-store"});
+    mine = r.ok ? await r.json() : {error: (await r.json().catch(() => ({}))).error || "link not accepted"};
+  } catch (e) {
+    mine = {error: "could not reach the bot"};
+  }
+  if (mine && !mine.error) mine.avail = mine.avail || {};
+}
+
+function renderMe() {
+  if (!mine) { $("title").textContent = "My availability"; return; }
+  if (mine.error) {
+    $("title").textContent = "My availability";
+    $("me-hint").textContent = mine.error + " — run /editlink in Discord for a fresh link.";
+    $("ed").innerHTML = "";
+    $("save").style.display = $("clearall").style.display = "none";
+    return;
+  }
+  $("title").textContent = "Editing " + mine.name;
+  if ($("myname") !== document.activeElement) $("myname").value = mine.name === "Unknown" ? "" : mine.name;
+  renderOff();
+  $("me-hint").textContent = mePane === "off"
+    ? "Your weekly hours apply every week. Click any date you're away and you'll be left out of that day only."
+    : "Click any slot to mark yourself free. Click a day name to toggle the whole column.";
+  if (mePane === "off") return;
+  let html = "<tr><th></th>" +
+    state.days.map(d => `<th class="col" data-day="${d}">${d.slice(0,3)}</th>`).join("") + "</tr>";
+  state.hourLabels.forEach((label, h) => {
+    html += `<tr><th class="row">${label}</th>`;
+    state.days.forEach(day => {
+      const on = (mine.avail[day] || []).includes(h);
+      html += `<td class="${on ? "on" : ""}" data-day="${day}" data-h="${h}">${on ? "✓" : ""}</td>`;
+    });
+    html += "</tr>";
+  });
+  $("ed").innerHTML = html;
+}
+
+function renderOff() {
+  if (!state) return;
+  const off = new Set(mine.off || []);
+  $("offmonths").innerHTML = seasonMonths().map(([y, m]) => monthBlock(y, m, (date, d) => {
+    const key = iso(date);
+    const past = key < state.today;
+    const cls = ["mday", "offday"];
+    if (off.has(key)) cls.push("off");
+    if (key === state.today) cls.push("today");
+    return `<div class="${cls.join(" ")}" data-date="${key}"
+      style="${past ? "opacity:.25;pointer-events:none" : ""}" title="${key}">${d}</div>`;
+  })).join("");
+}
+
+function toggleOff(key) {
+  mine.off = mine.off || [];
+  const i = mine.off.indexOf(key);
+  if (i === -1) mine.off.push(key); else mine.off.splice(i, 1);
+  mine.off.sort();
+  renderOff();
+}
+
+function setPane(which) {
+  mePane = which;
+  $("pane-week").hidden = which !== "week";
+  $("pane-off").hidden = which !== "off";
+  $("tab-week").className = "btn" + (which === "week" ? " pri" : "");
+  $("tab-off").className = "btn" + (which === "off" ? " pri" : "");
+  renderMe();
+}
+
+function toggleSlot(day, h) {
+  const list = mine.avail[day] || (mine.avail[day] = []);
+  const i = list.indexOf(h);
+  if (i === -1) list.push(h); else list.splice(i, 1);
+  list.sort((a, b) => a - b);
+  if (!list.length) delete mine.avail[day];
+  renderMe();
+}
+
+function toggleDay(day) {
+  const full = (mine.avail[day] || []).length === state.hourLabels.length;
+  if (full) delete mine.avail[day];
+  else mine.avail[day] = state.hourLabels.map((_, i) => i);
+  renderMe();
+}
+
+async function saveMine() {
+  $("savemsg").textContent = "Saving…";
+  try {
+    const r = await fetch("/api/me", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        key: KEY,
+        avail: mine.avail,
+        off: mine.off || [],
+        name: $("myname").value.trim() || undefined,
+      }),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
+    const saved = await r.json();
+    mine.name = saved.name;
+    $("savemsg").textContent = "Saved ✓";
+    await poll();                       // pull the team-wide numbers back in
+    setTimeout(() => $("savemsg").textContent = "", 2500);
+  } catch (e) {
+    $("savemsg").textContent = "Could not save: " + e.message;
+  }
+}
+
+function renderMonth() {
+  $("title").textContent = `${MONTHS[cursor.getMonth()]} ${cursor.getFullYear()}`;
+  const y = cursor.getFullYear(), m = cursor.getMonth();
+  const first = new Date(y, m, 1);
+  const lead = (first.getDay() + 6) % 7;           // Monday-first
+  const days = new Date(y, m + 1, 0).getDate();
+  const todayKey = ymd(new Date());
+
+  // events bucketed by calendar day
+  const byDay = {};
+  state.events.forEach(e => {
+    const d = new Date(e.start);
+    if (d.getFullYear() === y && d.getMonth() === m) (byDay[d.getDate()] ||= []).push(e);
+  });
+  // recurring availability peaks, keyed by weekday
+  const peak = {};
+  state.best.forEach(b => {
+    const wd = state.days.indexOf(b.day);
+    if (!peak[wd] || b.count > peak[wd].count) peak[wd] = b;
+  });
+  const maxCount = Math.max(1, ...state.best.map(b => b.count));
+
+  let html = "";
+  for (let i = 0; i < lead; i++) html += `<div class="cell pad"></div>`;
+  for (let d = 1; d <= days; d++) {
+    const date = new Date(y, m, d);
+    const wd = (date.getDay() + 6) % 7;
+    const evs = byDay[d] || [];
+    const p = peak[wd];
+    const isToday = ymd(date) === todayKey;
+
+    let inner = `<div class="n">${d}</div>`;
+    evs.slice(0, 2).forEach(e => {
+      inner += `<div class="chip" style="border-left-color:${hue(e.name)}">` +
+               `${esc(e.name)}<time>${clock(e.start)} · 👥 ${e.count}</time></div>`;
+    });
+    if (evs.length > 2) inner += `<div class="more">+${evs.length - 2} more</div>`;
+    if (!evs.length && p) {
+      inner += `<div class="chip p">${p.count}/${state.totalPeople} free<time>${p.label}</time></div>`;
+    }
+    if (p) {
+      inner += `<div class="heat" style="width:${Math.round(p.count / maxCount * 100)}%;` +
+               `opacity:${0.25 + 0.65 * (p.count / maxCount)}"></div>`;
+    }
+    html += `<div class="cell${isToday ? " today" : ""}">${inner}</div>`;
+  }
+  $("grid").innerHTML = html;
+}
+
+function renderHeat() {
+  $("title").textContent = "Team availability";
+  const max = Math.max(1, ...Object.values(state.counts).flatMap(o => Object.values(o)));
+  let html = "<tr><th></th>" + state.days.map(d => `<th>${d.slice(0,3)}</th>`).join("") + "</tr>";
+  state.hourLabels.forEach((label, h) => {
+    html += `<tr><th class="row">${label}</th>`;
+    state.days.forEach(day => {
+      const n = (state.counts[day] || {})[h] || 0;
+      const isBest = state.best.length && state.best[0].day === day && state.best[0].hour === h;
+      const bg = n ? `background:rgba(52,211,153,${(0.14 + 0.72 * n / max).toFixed(2)});` : "";
+      html += `<td class="${n ? "" : "z"}${isBest ? " best" : ""}" style="${bg}">${n || "·"}</td>`;
+    });
+    html += "</tr>";
+  });
+  $("hm").innerHTML = html;
+}
+
+function renderBest() {
+  $("title").textContent = "Best meeting times";
+  if (!state.best.length) {
+    $("best").innerHTML = `<div class="empty">No availability submitted yet — run <b>/free</b> in Discord.</div>`;
+    return;
+  }
+  const top = state.best[0].count;
+  // Everyone-can-make-it windows are the answer; the rest are fallbacks, so
+  // they get a quieter treatment instead of competing for attention.
+  const full = state.best.filter(b => b.count === top);
+  const rest = state.best.filter(b => b.count !== top);
+
+  const card = (b, i) => {
+    const pct = Math.round(b.count / state.totalPeople * 100);
+    const d = new Date(b.date + "T12:00:00");
+    return `
+    <div class="bcard${i === 0 ? " win" : ""}">
+      <div class="bhead">
+        <div>
+          <div class="bwhen">${b.day}, ${d.toLocaleDateString([], {month:"long", day:"numeric"})}</div>
+          <div class="btime">${b.label}</div>
+        </div>
+        <div class="bcount"><b>${b.count}<span>/${state.totalPeople}</span></b><span>free</span></div>
+      </div>
+      <div class="bbar"><i style="width:${pct}%"></i></div>
+      <div class="bfoot">
+        <span class="pill">${b.span}h window</span>
+        <span class="who">${esc(b.people.join(", "))}</span>
+      </div>
+    </div>`;
+  };
+
+  $("best").innerHTML =
+    `<h3 class="sec">Everyone available (${full.length})</h3>
+     <div class="cards">${full.map(card).join("")}</div>` +
+    (rest.length ? `<h3 class="sec">Partial turnout</h3>
+     <div class="cards dim">${rest.map(b => card(b, -1)).join("")}</div>` : "");
+}
+
+function renderTeam() {
+  $("title").textContent = "Team";
+  $("team").innerHTML = state.people.length ? state.people.map(p => {
+    const rows = state.days.filter(d => p.avail[d]).map(d =>
+      `<div>${d} — ${p.avail[d].map(h => state.hourLabels[h]).join(", ")}</div>`).join("");
+    return `<div class="card" style="border-left-color:${hue(p.name)}">
+      <h4>${esc(p.name)}</h4><div class="who">${rows || "no days saved"}</div></div>`;
+  }).join("") : `<div class="empty">Nobody has submitted availability yet.</div>`;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/state", {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    state = await r.json();
+    $("upd").textContent = "updated " + new Date().toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
+    render();
+  } catch (e) {
+    $("upd").textContent = "bot offline — retrying";
+  }
+}
+
+document.querySelectorAll(".nav").forEach(n => n.onclick = () => setView(n.dataset.view, true));
+$("prev").onclick = () => { cursor = new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1); render(); };
+$("next").onclick = () => { cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1); render(); };
+$("today").onclick = () => { cursor = new Date(); render(); };
+addEventListener("hashchange", () => setView(location.hash.slice(1), false));
+
+$("ed").onclick = (e) => {
+  const cell = e.target.closest("td[data-day]");
+  if (cell) return toggleSlot(cell.dataset.day, +cell.dataset.h);
+  const col = e.target.closest("th.col");
+  if (col) toggleDay(col.dataset.day);
+};
+$("offmonths").onclick = (e) => {
+  const cell = e.target.closest(".offday");
+  if (cell) toggleOff(cell.dataset.date);
+};
+$("tab-week").onclick = () => setPane("week");
+$("tab-off").onclick = () => setPane("off");
+$("save").onclick = saveMine;
+$("clearall").onclick = () => { mine.avail = {}; renderMe(); };
+
+(async () => {
+  await loadMine();
+  // Land straight on the editor when someone opens their personal link.
+  setView(location.hash.slice(1) || (KEY ? "me" : "cal"), false);
+  await poll();
+  setInterval(poll, 15000);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+async def start_dashboard(
+    get_state: StateProvider,
+    host: str,
+    port: int,
+    get_user: Callable[[str], Awaitable[dict | None]] | None = None,
+    save_user: Callable[[str, dict, list, str | None], Awaitable[dict | None]] | None = None,
+) -> web.AppRunner | None:
+    """Serve the dashboard on the running event loop. Returns None if it can't bind.
+
+    get_user/save_user back the personal editor. Both take an edit key and
+    return None when it doesn't check out, which the routes turn into a 403 --
+    the public link can read everything but can't write anything.
+    """
+    app = web.Application()
+
+    async def page(_request: web.Request) -> web.Response:
+        return web.Response(text=PAGE, content_type="text/html")
+
+    async def state(_request: web.Request) -> web.Response:
+        try:
+            return web.json_response(await get_state())
+        except Exception:
+            log.exception("Failed to build dashboard state")
+            return web.json_response({"error": "internal"}, status=500)
+
+    async def me_get(request: web.Request) -> web.Response:
+        if get_user is None:
+            return web.json_response({"error": "editing disabled"}, status=404)
+        try:
+            result = await get_user(request.query.get("key", ""))
+        except Exception:
+            log.exception("Failed to read personal availability")
+            return web.json_response({"error": "internal"}, status=500)
+        if result is None:
+            return web.json_response({"error": "invalid or expired link"}, status=403)
+        return web.json_response(result)
+
+    async def me_post(request: web.Request) -> web.Response:
+        if save_user is None:
+            return web.json_response({"error": "editing disabled"}, status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "malformed request"}, status=400)
+        if not isinstance(body, dict) or not isinstance(body.get("avail"), dict):
+            return web.json_response({"error": "malformed request"}, status=400)
+        try:
+            result = await save_user(
+                str(body.get("key", "")),
+                body["avail"],
+                body.get("off") or [],
+                body.get("name"),
+            )
+        except Exception:
+            log.exception("Failed to save personal availability")
+            return web.json_response({"error": "could not save"}, status=500)
+        if result is None:
+            return web.json_response({"error": "invalid or expired link"}, status=403)
+        return web.json_response(result)
+
+    app.add_routes([
+        web.get("/", page),
+        web.get("/api/state", state),
+        web.get("/api/me", me_get),
+        web.post("/api/me", me_post),
+    ])
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, host, port).start()
+    except OSError as exc:
+        # A busy port shouldn't stop the Discord half of the bot from running.
+        log.error("Dashboard could not bind to %s:%s (%s)", host, port, exc)
+        await runner.cleanup()
+        return None
+
+    log.info("Dashboard running at http://%s:%s", host, port)
+    return runner

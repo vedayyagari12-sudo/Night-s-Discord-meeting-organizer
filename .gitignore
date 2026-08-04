@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.env
+availability.json
+availability.tmp
+availability.corrupt.json
+__pycache__/
+
+# 50MB+ binary, downloaded per-machine rather than committed
+cloudflared*.exe
+
+# signs personal edit links; must never be shared
+.dashboard_secret
