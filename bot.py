@@ -158,9 +158,16 @@ def clock_range(start: datetime, end: datetime) -> str:
 # On disk:
 #   { "<user_id>": {
 #       "name": str,
-#       "avail": { "Monday": {"hours": [0, 1, 2], "updated": "<iso8601>"} }
+#       "avail": { "Monday": {"hours": [0, 1, 2], "updated": "<iso8601>"} },
+#       "dates": { "2026-08-18": [7, 8, 9] },
+#       "off":   ["2026-08-25"]
 #   } }
-# The ints in "hours" are indices into HOUR_LABELS.
+# The ints in "hours" and in "dates" are indices into HOUR_LABELS.
+#
+# "avail" is the standing weekly pattern. "dates" overrides it for one specific
+# date -- free 5-8 this Tuesday but only 3-4 the next -- and an empty list there
+# means "free for nothing that date". "off" is the shorthand for a whole day
+# away and wins over both. See free_on for the precedence.
 #
 # Older files stored "Monday": [0, 1, 2] directly. _migrate_record upgrades
 # those in place; entries with no timestamp are kept (we can't know their age)
@@ -181,6 +188,13 @@ def _parse_ts(raw: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=TZ)
 
 
+def _clean_hours(raw: Any) -> list[int]:
+    """Sorted, de-duplicated, in-range hour indices from untrusted input."""
+    if not isinstance(raw, list):
+        return []
+    return sorted({h for h in raw if isinstance(h, int) and 0 <= h < len(HOUR_LABELS)})
+
+
 def _migrate_record(record: dict) -> dict:
     """Coerce one user record into the current shape, dropping junk."""
     avail: dict[str, dict] = {}
@@ -189,12 +203,12 @@ def _migrate_record(record: dict) -> dict:
             continue
         raw_hours = value if isinstance(value, list) else (value or {}).get("hours", [])
         updated = None if isinstance(value, list) else (value or {}).get("updated")
-        hours = sorted({int(h) for h in raw_hours if isinstance(h, int) and 0 <= h < len(HOUR_LABELS)})
+        hours = _clean_hours(raw_hours)
         if hours:
             avail[day] = {"hours": hours, "updated": updated}
 
-    # Keep only well-formed, still-relevant off dates so the list can't grow
-    # without bound as the season goes by.
+    # Keep only well-formed, still-relevant off dates and per-date overrides, so
+    # neither can grow without bound as the season goes by.
     today = datetime.now(TZ).date().isoformat()
     off = sorted(
         {
@@ -203,7 +217,17 @@ def _migrate_record(record: dict) -> dict:
             if isinstance(value, str) and _valid_date(value) and value >= today
         }
     )
-    return {"name": str(record.get("name") or "Unknown"), "avail": avail, "off": off}
+    dates = {
+        key: _clean_hours(value)
+        for key, value in sorted((record.get("dates") or {}).items())
+        if isinstance(key, str) and _valid_date(key) and key >= today
+    }
+    return {
+        "name": str(record.get("name") or "Unknown"),
+        "avail": avail,
+        "dates": dates,
+        "off": off,
+    }
 
 
 def _valid_date(value: str) -> bool:
@@ -215,17 +239,32 @@ def _valid_date(value: str) -> bool:
 
 
 def _prune_expired(data: dict) -> bool:
-    """Drop day entries past the TTL. Returns True if anything changed."""
+    """Drop day entries past the TTL and overrides for dates already gone.
+
+    Returns True if anything changed.
+    """
     cutoff = datetime.now(TZ) - AVAILABILITY_TTL
+    today = datetime.now(TZ).date().isoformat()
     changed = False
     for uid in list(data):
-        avail = data[uid]["avail"]
+        record = data[uid]
+        avail = record["avail"]
         for day in list(avail):
             ts = _parse_ts(avail[day].get("updated"))
             if ts and ts < cutoff:
                 del avail[day]
                 changed = True
-        if not avail:
+        # A date override is self-expiring: once the date is past it can never
+        # apply again. Same for a day marked away.
+        for key in [k for k in record.get("dates", {}) if k < today]:
+            del record["dates"][key]
+            changed = True
+        stale_off = [k for k in record.get("off", []) if k < today]
+        if stale_off:
+            record["off"] = [k for k in record["off"] if k >= today]
+            changed = True
+        # Someone may have only date-specific hours and no weekly pattern.
+        if not avail and not record.get("dates"):
             del data[uid]
             changed = True
     return changed
@@ -372,7 +411,8 @@ def _file_stamp() -> tuple[int, int] | None:
 def _normalise(raw: dict) -> tuple[dict, bool]:
     """Migrate every record to the current shape and drop expired entries."""
     data = {str(uid): _migrate_record(rec) for uid, rec in raw.items() if isinstance(rec, dict)}
-    data = {uid: rec for uid, rec in data.items() if rec["avail"]}
+    # Keep anyone with a weekly pattern *or* date-specific hours.
+    data = {uid: rec for uid, rec in data.items() if rec["avail"] or rec["dates"]}
     pruned = _prune_expired(data)
     if pruned:
         log.info("Pruned availability older than %s", AVAILABILITY_TTL)
@@ -560,12 +600,16 @@ async def dashboard_get_user(token: str) -> dict | None:
     return {
         "name": await resolve_name(user_id, data),
         "avail": {day: entry["hours"] for day, entry in record["avail"].items()} if record else {},
+        "dates": dict(record.get("dates") or {}) if record else {},
         "off": sorted(off_dates(record)) if record else [],
+        "today": datetime.now(TZ).date().isoformat(),
         "seasonEnd": SEASON_END.isoformat(),
     }
 
 
-async def dashboard_save_user(token: str, avail: dict, off: list, name: str | None) -> dict | None:
+async def dashboard_save_user(
+    token: str, avail: dict, off: list, name: str | None, dates: dict | None = None
+) -> dict | None:
     """Replace one member's availability from the web editor.
 
     The token decides whose row is written, never anything in the request body,
@@ -579,7 +623,7 @@ async def dashboard_save_user(token: str, avail: dict, off: list, name: str | No
     for day, hours in avail.items():
         if day not in DAYS or not isinstance(hours, list):
             continue
-        valid = sorted({h for h in hours if isinstance(h, int) and 0 <= h < len(HOUR_LABELS)})
+        valid = _clean_hours(hours)
         if valid:
             cleaned[day] = valid
 
@@ -592,15 +636,27 @@ async def dashboard_save_user(token: str, avail: dict, off: list, name: str | No
         }
     )
 
+    # An override with an empty list is meaningful ("free for nothing that
+    # date"), so unlike the weekly pattern it is kept rather than dropped.
+    overrides: dict[str, list[int]] = {}
+    for key, hours in (dates or {}).items():
+        if not isinstance(key, str) or not _valid_date(key):
+            continue
+        if not (today <= key <= SEASON_END.isoformat()) or not isinstance(hours, list):
+            continue
+        overrides[key] = _clean_hours(hours)
+    overrides = dict(sorted(overrides.items()))
+
     data = load_data()
     chosen = (name or "").strip()[:32] if isinstance(name, str) else ""
     final_name = chosen or await resolve_name(user_id, data)
 
-    if cleaned:
+    if cleaned or overrides:
         stamp = _now_iso()
         data[user_id] = {
             "name": final_name,
             "avail": {day: {"hours": hours, "updated": stamp} for day, hours in cleaned.items()},
+            "dates": overrides,
             "off": away,
         }
     else:
@@ -608,7 +664,13 @@ async def dashboard_save_user(token: str, avail: dict, off: list, name: str | No
         data.pop(user_id, None)
     save_data(data)
     log.info("%s updated availability from the web editor", final_name)
-    return {"ok": True, "name": final_name, "avail": cleaned, "off": away}
+    return {
+        "ok": True,
+        "name": final_name,
+        "avail": cleaned,
+        "dates": overrides,
+        "off": away,
+    }
 
 
 # ---------- time helpers ----------
@@ -628,14 +690,6 @@ def next_occurrence(day: str, hour: int, minute: int = 0) -> datetime:
     return candidate.replace(tzinfo=TZ)
 
 
-def people_free(data: dict, day: str, hour_index: int) -> list[str]:
-    return sorted(
-        rec["name"]
-        for rec in data.values()
-        if hour_index in rec["avail"].get(day, {}).get("hours", [])
-    )
-
-
 def hour_range_label(start: int, end: int) -> str:
     """'1PM-8PM' for the inclusive slot range start..end."""
     return f"{HOUR_START_LABELS[start]}-{fmt_hour(START_HOUR + end).split('-')[1]}"
@@ -644,7 +698,8 @@ def hour_range_label(start: int, end: int) -> str:
 # ---------- date-aware availability ----------
 # The weekly pattern in "avail" is the standing arrangement. "off" lists
 # specific dates a member is away, so nobody has to re-enter their whole week
-# just because they're busy one Saturday.
+# just because they're busy one Saturday. "dates" overrides the weekly hours on
+# one date, which is what makes "free 5-8 this Tuesday, 3-4 the next" possible.
 SEASON_END = date(2027, 2, 28)
 
 
@@ -652,18 +707,30 @@ def off_dates(record: dict) -> set[str]:
     return set(record.get("off") or [])
 
 
+def hours_on(record: dict, day: date) -> list[int]:
+    """The hours one member is free on a concrete date.
+
+    Precedence: a day marked away beats everything, then a date-specific
+    override, then the standing weekly pattern.
+    """
+    key = day.isoformat()
+    if key in off_dates(record):
+        return []
+    override = (record.get("dates") or {}).get(key)
+    if override is not None:
+        return list(override)
+    return list(record["avail"].get(DAYS[day.weekday()], {}).get("hours", []))
+
+
+def has_override(record: dict, day: date) -> bool:
+    return day.isoformat() in (record.get("dates") or {})
+
+
 def free_on(data: dict, day: date) -> dict[int, list[str]]:
     """hour index -> names of everyone free at that hour on this specific date."""
-    weekday = DAYS[day.weekday()]
-    key = day.isoformat()
     result: dict[int, list[str]] = {}
     for record in data.values():
-        if key in off_dates(record):
-            continue
-        entry = record["avail"].get(weekday)
-        if not entry:
-            continue
-        for hour_index in entry["hours"]:
+        for hour_index in hours_on(record, day):
             result.setdefault(hour_index, []).append(record["name"])
     return {h: sorted(names) for h, names in result.items()}
 
@@ -746,13 +813,19 @@ def overlapped_slots(hour: int, minute: int, duration_minutes: int) -> list[int]
     ]
 
 
-def attendees_for(data: dict, day: str, hour: int, minute: int, duration_minutes: int) -> list[str]:
-    """Everyone free for *every* availability hour the event runs across."""
+def attendees_for(
+    data: dict, on_date: date, hour: int, minute: int, duration_minutes: int
+) -> list[str]:
+    """Everyone free for *every* availability hour the event runs across.
+
+    Resolved against the concrete date, so per-date overrides and days marked
+    away are both respected.
+    """
     slots = overlapped_slots(hour, minute, duration_minutes)
     if not slots:
         return []
-    free = [set(people_free(data, day, h)) for h in slots]
-    return sorted(set.intersection(*free))
+    free = free_on(data, on_date)
+    return sorted(set.intersection(*(set(free.get(h, [])) for h in slots)))
 
 
 def day_totals(data: dict, start: date, end: date) -> dict[str, dict]:
@@ -788,6 +861,9 @@ def day_detail(data: dict, day: date) -> dict:
     free = free_on(data, day)
     key = day.isoformat()
     away = sorted(rec["name"] for rec in data.values() if key in off_dates(rec))
+    # Who is on date-specific hours here rather than their usual weekly ones --
+    # this is what explains two Tuesdays looking different.
+    custom = sorted(rec["name"] for rec in data.values() if has_override(rec, day))
     hours = [
         {
             "index": i,
@@ -818,6 +894,7 @@ def day_detail(data: dict, day: date) -> dict:
         "hours": hours,
         "windows": windows,
         "away": away,
+        "custom": custom,
         "isPast": day < datetime.now(TZ).date(),
         "inSeason": day <= SEASON_END,
     }
@@ -881,6 +958,7 @@ def help_embed() -> discord.Embed:
     embed.add_field(
         name="/dashboard",
         value="**Start here.** Your private link to the web dashboard: set your weekly hours, "
+        "give a single date its own hours (free 5-8 this Tuesday but 3-4 the next), "
         "mark days you're away, and see the calendar, heatmap and team views.",
         inline=False,
     )
@@ -1457,6 +1535,7 @@ async def dashboard_state() -> dict:
             {
                 "name": rec["name"],
                 "avail": {d: e["hours"] for d, e in rec["avail"].items()},
+                "dates": dict(rec.get("dates") or {}),
                 "off": sorted(off_dates(rec)),
             }
             for rec in sorted(data.values(), key=lambda r: r["name"].casefold())
@@ -1716,8 +1795,12 @@ async def schedule(
 
     await interaction.response.defer()
     data = load_data()
+    # Resolve the concrete date up front: attendees are date-specific (someone
+    # may have overridden their hours for that Tuesday), and passing the same
+    # date on to create_meeting_event keeps the two from disagreeing.
+    start = next_occurrence(day.value, hour.value, start_minute)
     # Everyone free for every hour the meeting touches, not just its first.
-    attendees = attendees_for(data, day.value, hour.value, start_minute, duration_minutes)
+    attendees = attendees_for(data, start.date(), hour.value, start_minute, duration_minutes)
     try:
         event = await create_meeting_event(
             interaction.guild,
@@ -1728,6 +1811,7 @@ async def schedule(
             title,
             location,
             attendees,
+            on_date=start.date(),
         )
     except Exception as exc:  # surfaced to the user by respond_to_event_error
         await respond_to_event_error(interaction, exc)
@@ -1849,7 +1933,7 @@ async def reschedule(
 
     _events_cache.pop(interaction.guild.id, None)  # next read picks up the new time
     data = load_data()
-    attendees = attendees_for(data, DAYS[on_date.weekday()], start.hour, start.minute, duration_minutes)
+    attendees = attendees_for(data, on_date, start.hour, start.minute, duration_minutes)
     embed = base_embed("Event moved", f"**{target.name}**", COLOR_OK)
     embed.add_field(
         name="Was",

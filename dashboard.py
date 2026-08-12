@@ -261,6 +261,24 @@ PAGE = """<!doctype html>
   .ed td.on { background: var(--green); color: #06281d; font-weight: 700; border-color: transparent; }
   .ed th.col { cursor: pointer; }
   .ed th.col:hover { color: var(--text); text-decoration: underline; }
+  /* one toggle per hour, for the date-specific editor */
+  .slots { display: grid; gap: 7px; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); }
+  .slot {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+    border-radius: 9px; padding: 9px 11px; cursor: pointer; font: inherit;
+    font-size: 13.5px; text-align: left; font-variant-numeric: tabular-nums;
+  }
+  .slot:hover { border-color: var(--muted); color: var(--text); }
+  .slot.on { background: var(--green); color: #06281d; font-weight: 700; border-color: transparent; }
+  .ovrow {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 9px 13px; margin-bottom: 7px; flex-wrap: wrap;
+  }
+  .ovrow.on { border-color: var(--blue); }
+  .ovrow b { font-size: 14px; }
+  .ovrow .hrs { color: var(--muted); font-size: 12.5px; }
+
   .savebar { display: flex; align-items: center; gap: 11px; margin-top: 18px; flex-wrap: wrap; }
   .savebar .hint { margin: 0; }
   h3.sec { font-size: 13px; color: var(--muted); text-transform: uppercase;
@@ -337,10 +355,27 @@ PAGE = """<!doctype html>
         </div>
         <div class="tabs">
           <button class="btn pri" id="tab-week">Weekly hours</button>
+          <button class="btn" id="tab-dates">A specific date</button>
           <button class="btn" id="tab-off">Days I'm away</button>
         </div>
         <p class="hint" id="me-hint"></p>
         <div id="pane-week"><div class="heatwrap"><table class="hm ed" id="ed"></table></div></div>
+        <div id="pane-dates" hidden>
+          <div class="daybar">
+            <button class="btn" id="ov-prev">‹</button>
+            <input type="date" id="ovdate">
+            <button class="btn" id="ov-next">›</button>
+            <span id="ov-state" class="hint" style="margin:0"></span>
+          </div>
+          <div id="ov-slots" class="slots"></div>
+          <div class="savebar" style="margin-top:14px">
+            <button class="btn" id="ov-copy">Start from my weekly hours</button>
+            <button class="btn" id="ov-none">I'm free for none of it</button>
+            <button class="btn" id="ov-clear">Use my weekly hours instead</button>
+          </div>
+          <h3 class="sec">Dates with their own hours</h3>
+          <div id="ov-list"></div>
+        </div>
         <div id="pane-off" hidden><div class="months" id="offmonths"></div></div>
         <div class="savebar">
           <button class="btn pri" id="save">Save</button>
@@ -390,6 +425,7 @@ let dayReq = 0;   // guards against a slow response for an older date landing la
 const KEY = new URLSearchParams(location.search).get("key");
 let mine = null;
 let mePane = "week";
+let ovDate = null;   // which date the "A specific date" tab is editing
 
 function setView(v, push) {
   view = VIEWS.includes(v) ? v : "cal";
@@ -488,7 +524,10 @@ function renderDay() {
       ${info ? `<span class="pill">${info.peak}/${info.totalPeople} free at best</span>
                 <span class="pill">${info.freeHours} free hour${info.freeHours === 1 ? "" : "s"}</span>` : ""}
       ${info && info.away.length ? `<span class="pill">${info.away.length} away</span>` : ""}
+      ${info && (info.custom || []).length ? `<span class="pill">${info.custom.length} on date-specific hours</span>` : ""}
     </div>
+    ${KEY ? `<div style="margin-top:11px">
+      <button class="btn" id="edit-this">Set my hours for this date</button></div>` : ""}
   </div>`;
 
   if (!info) {
@@ -534,11 +573,19 @@ function renderDay() {
       </div>`).join("") + `</div>`;
   }
 
+  if ((info.custom || []).length) {
+    html += `<h3 class="sec">Hours set just for this date (${info.custom.length})</h3>
+             <p class="hint">${esc(info.custom.join(", "))} — these people set hours for this
+             date specifically, so it differs from their usual ${esc(info.weekday)}.</p>`;
+  }
   if (info.away.length) {
     html += `<h3 class="sec">Away this date (${info.away.length})</h3>
              <p class="hint">${esc(info.away.join(", "))}</p>`;
   }
   $("daybody").innerHTML = html;
+
+  const edit = $("edit-this");
+  if (edit) edit.onclick = () => { setOvDate(key); setPane("dates"); setView("me", true); };
 }
 
 // One month block, shared by the season overview and the days-off picker.
@@ -594,7 +641,11 @@ async function loadMine() {
   } catch (e) {
     mine = {error: "could not reach the bot"};
   }
-  if (mine && !mine.error) mine.avail = mine.avail || {};
+  if (mine && !mine.error) {
+    mine.avail = mine.avail || {};
+    mine.dates = mine.dates || {};
+    if (!ovDate) ovDate = mine.today || state?.today || iso(new Date());
+  }
 }
 
 function renderMe() {
@@ -609,10 +660,13 @@ function renderMe() {
   $("title").textContent = "Editing " + mine.name;
   if ($("myname") !== document.activeElement) $("myname").value = mine.name === "Unknown" ? "" : mine.name;
   renderOff();
-  $("me-hint").textContent = mePane === "off"
-    ? "Your weekly hours apply every week. Click any date you're away and you'll be left out of that day only."
-    : "Click any slot to mark yourself free. Click a day name to toggle the whole column.";
-  if (mePane === "off") return;
+  renderOverrides();
+  $("me-hint").textContent = {
+    off: "Your weekly hours apply every week. Click any date you're away and you'll be left out of that day only.",
+    dates: "For one date only — free 5-8 this Tuesday but 3-4 the next. These hours replace your weekly ones on that date and change nothing else.",
+    week: "Click any slot to mark yourself free. Click a day name to toggle the whole column.",
+  }[mePane];
+  if (mePane !== "week") return;
   let html = "<tr><th></th>" +
     state.days.map(d => `<th class="col" data-day="${d}">${d.slice(0,3)}</th>`).join("") + "</tr>";
   state.hourLabels.forEach((label, h) => {
@@ -648,11 +702,93 @@ function toggleOff(key) {
   renderOff();
 }
 
+// ---------- date-specific hours ----------
+// mine.dates[key] replaces the weekly pattern on that one date. An empty array
+// is a real value ("free for none of it"), so absence is the only way to say
+// "just use my weekly hours" -- hence the delete in clearOverride.
+// The tab's buttons stay in the DOM even when the link didn't check out, so
+// every entry point checks that there is actually a record to edit.
+const editable = () => !!(state && mine && !mine.error && mine.dates && ovDate);
+const weeklyHoursFor = (key) => mine.avail[state.days[(atNoon(key).getDay() + 6) % 7]] || [];
+const overrideFor = (key) => mine.dates[key];
+
+function renderOverrides() {
+  if (!editable() || mePane !== "dates") return;
+  const key = ovDate;
+  if ($("ovdate").value !== key) $("ovdate").value = key;
+  $("ovdate").min = state.today;
+  $("ovdate").max = state.seasonEnd;
+
+  const custom = overrideFor(key);
+  const hours = custom !== undefined ? custom : weeklyHoursFor(key);
+  const away = (mine.off || []).includes(key);
+  $("ov-state").innerHTML = away
+    ? `<b>${esc(fullLabel(key))}</b> — you're marked away all day, so these hours won't count.`
+    : custom !== undefined
+      ? `<b>${esc(fullLabel(key))}</b> — using hours set just for this date.`
+      : `<b>${esc(fullLabel(key))}</b> — following your usual ${state.days[(atNoon(key).getDay() + 6) % 7]} hours.`;
+
+  $("ov-slots").innerHTML = state.hourLabels.map((label, h) => {
+    const on = hours.includes(h);
+    return `<button class="slot${on ? " on" : ""}" data-h="${h}">${on ? "✓ " : ""}${label}</button>`;
+  }).join("");
+
+  const keys = Object.keys(mine.dates).sort();
+  $("ov-list").innerHTML = keys.length ? keys.map(k => {
+    const list = mine.dates[k];
+    const text = list.length
+      ? list.map(h => state.hourLabels[h]).join(", ")
+      : "free for none of it";
+    return `<div class="ovrow${k === key ? " on" : ""}">
+      <div><b>${esc(fullLabel(k))}</b><div class="hrs">${esc(text)}</div></div>
+      <div>
+        <button class="btn" data-open="${k}">Edit</button>
+        <button class="btn" data-drop="${k}">Remove</button>
+      </div>
+    </div>`;
+  }).join("") : `<p class="hint">No date-specific hours yet — pick a date above and set them.</p>`;
+}
+
+function setOvDate(key) {
+  if (!key) return;
+  ovDate = key;
+  renderOverrides();
+}
+
+function shiftOvDate(days) {
+  if (!editable()) return;
+  const d = atNoon(ovDate);
+  d.setDate(d.getDate() + days);
+  const key = iso(d);
+  if (key >= state.today && key <= state.seasonEnd) setOvDate(key);
+}
+
+// The first edit seeds from the weekly pattern, so tweaking one Tuesday doesn't
+// mean re-entering the whole day from scratch.
+function toggleOverrideHour(h) {
+  if (!editable()) return;
+  const current = overrideFor(ovDate);
+  const list = current !== undefined ? current.slice() : weeklyHoursFor(ovDate).slice();
+  const i = list.indexOf(h);
+  if (i === -1) list.push(h); else list.splice(i, 1);
+  list.sort((a, b) => a - b);
+  mine.dates[ovDate] = list;
+  renderOverrides();
+}
+
+function clearOverride(key) {
+  if (!editable()) return;
+  delete mine.dates[key];
+  renderOverrides();
+}
+
 function setPane(which) {
   mePane = which;
   $("pane-week").hidden = which !== "week";
+  $("pane-dates").hidden = which !== "dates";
   $("pane-off").hidden = which !== "off";
   $("tab-week").className = "btn" + (which === "week" ? " pri" : "");
+  $("tab-dates").className = "btn" + (which === "dates" ? " pri" : "");
   $("tab-off").className = "btn" + (which === "off" ? " pri" : "");
   renderMe();
 }
@@ -682,6 +818,7 @@ async function saveMine() {
       body: JSON.stringify({
         key: KEY,
         avail: mine.avail,
+        dates: mine.dates || {},
         off: mine.off || [],
         name: $("myname").value.trim() || undefined,
       }),
@@ -689,6 +826,10 @@ async function saveMine() {
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
     const saved = await r.json();
     mine.name = saved.name;
+    // Adopt what the server actually stored -- it drops past dates and anything
+    // out of season, so the editor should stop showing them as saved.
+    mine.dates = saved.dates || {};
+    mine.off = saved.off || [];
     $("savemsg").textContent = "Saved ✓";
     await poll();                       // pull the team-wide numbers back in
     setTimeout(() => $("savemsg").textContent = "", 2500);
@@ -811,8 +952,13 @@ function renderTeam() {
   $("team").innerHTML = state.people.length ? state.people.map(p => {
     const rows = state.days.filter(d => p.avail[d]).map(d =>
       `<div>${d} — ${p.avail[d].map(h => state.hourLabels[h]).join(", ")}</div>`).join("");
+    const dates = Object.keys(p.dates || {}).sort();
+    const extra = dates.length
+      ? `<div style="margin-top:6px">${dates.length} date${dates.length === 1 ? "" : "s"} with
+         their own hours: ${esc(dates.map(k => fullLabel(k)).join("; "))}</div>`
+      : "";
     return `<div class="card" style="border-left-color:${hue(p.name)}">
-      <h4>${esc(p.name)}</h4><div class="who">${rows || "no days saved"}</div></div>`;
+      <h4>${esc(p.name)}</h4><div class="who">${rows || "no weekly hours saved"}${extra}</div></div>`;
   }).join("") : `<div class="empty">Nobody has submitted availability yet.</div>`;
 }
 
@@ -871,7 +1017,28 @@ $("offmonths").onclick = (e) => {
   if (cell) toggleOff(cell.dataset.date);
 };
 $("tab-week").onclick = () => setPane("week");
+$("tab-dates").onclick = () => setPane("dates");
 $("tab-off").onclick = () => setPane("off");
+$("ov-slots").onclick = (e) => {
+  const slot = e.target.closest(".slot[data-h]");
+  if (slot) toggleOverrideHour(+slot.dataset.h);
+};
+$("ov-list").onclick = (e) => {
+  const open = e.target.closest("[data-open]");
+  if (open) return setOvDate(open.dataset.open);
+  const drop = e.target.closest("[data-drop]");
+  if (drop) clearOverride(drop.dataset.drop);
+};
+$("ovdate").onchange = () => setOvDate($("ovdate").value);
+$("ov-prev").onclick = () => shiftOvDate(-1);
+$("ov-next").onclick = () => shiftOvDate(1);
+$("ov-copy").onclick = () => {
+  if (editable()) { mine.dates[ovDate] = weeklyHoursFor(ovDate).slice(); renderOverrides(); }
+};
+$("ov-none").onclick = () => {
+  if (editable()) { mine.dates[ovDate] = []; renderOverrides(); }
+};
+$("ov-clear").onclick = () => clearOverride(ovDate);
 $("save").onclick = saveMine;
 $("clearall").onclick = () => { mine.avail = {}; renderMe(); };
 
@@ -893,7 +1060,7 @@ async def start_dashboard(
     host: str,
     port: int,
     get_user: Callable[[str], Awaitable[dict | None]] | None = None,
-    save_user: Callable[[str, dict, list, str | None], Awaitable[dict | None]] | None = None,
+    save_user: Callable[[str, dict, list, str | None, dict], Awaitable[dict | None]] | None = None,
     get_day: Callable[[str], Awaitable[dict | None]] | None = None,
 ) -> web.AppRunner | None:
     """Serve the dashboard on the running event loop. Returns None if it can't bind.
@@ -959,12 +1126,16 @@ async def start_dashboard(
             return web.json_response({"error": "malformed request"}, status=400)
         if not isinstance(body, dict) or not isinstance(body.get("avail"), dict):
             return web.json_response({"error": "malformed request"}, status=400)
+        dates = body.get("dates")
+        if dates is not None and not isinstance(dates, dict):
+            return web.json_response({"error": "malformed request"}, status=400)
         try:
             result = await save_user(
                 str(body.get("key", "")),
                 body["avail"],
                 body.get("off") or [],
                 body.get("name"),
+                dates or {},
             )
         except Exception:
             log.exception("Failed to save personal availability")
