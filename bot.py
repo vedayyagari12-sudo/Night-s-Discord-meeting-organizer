@@ -17,7 +17,9 @@ import secrets
 import time
 import traceback
 from collections import defaultdict
-from datetime import date, datetime, time as dtime, timedelta
+# date_cls is the same class under a second name: /reschedule takes a parameter
+# called "date" (that is what Discord shows the user), which shadows it locally.
+from datetime import date, date as date_cls, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -118,6 +120,38 @@ HOUR_LABELS = [fmt_hour(h) for h in range(START_HOUR, END_HOUR)]
 # Short "10AM" form -- buttons are narrow, and every slot is exactly one hour,
 # so the start time alone is unambiguous.
 HOUR_START_LABELS = [label.split("-")[0] for label in HOUR_LABELS]
+
+# Events are scheduled on a finer grid than availability is collected on: people
+# tell us which *hours* they are free, but a meeting can start at 8:15 and run
+# for 45 minutes. SLOT_MINUTES is the granularity every event time snaps to.
+SLOT_MINUTES = 15
+MINUTE_CHOICES = list(range(0, 60, SLOT_MINUTES))
+
+# Lengths offered when creating or editing an event, in minutes. Fine-grained
+# near the bottom where quarter-hours actually matter, coarser further out.
+DURATION_MINUTES = [15, 30, 45, 60, 75, 90, 105, 120, 150, 180, 210, 240, 300, 360, 420, 480]
+
+
+def fmt_clock(hour: int, minute: int = 0) -> str:
+    """'8:15 AM' for a wall-clock time."""
+    suffix = "AM" if hour % 24 < 12 else "PM"
+    return f"{hour % 12 or 12}:{minute:02d} {suffix}"
+
+
+def fmt_duration(minutes: int) -> str:
+    """'1 hour 30 minutes' for a length in minutes."""
+    hours, mins = divmod(int(minutes), 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours > 1 else ''}")
+    if mins:
+        parts.append(f"{mins} minutes")
+    return " ".join(parts) or "0 minutes"
+
+
+def clock_range(start: datetime, end: datetime) -> str:
+    """'8:15 AM – 9:45 AM' for a concrete event window."""
+    return f"{fmt_clock(start.hour, start.minute)} – {fmt_clock(end.hour, end.minute)}"
 
 
 # ---------- storage ----------
@@ -578,15 +612,15 @@ async def dashboard_save_user(token: str, avail: dict, off: list, name: str | No
 
 
 # ---------- time helpers ----------
-def next_occurrence(day: str, hour_index: int) -> datetime:
-    """The next upcoming `day` at that slot's start hour, in US Eastern.
+def next_occurrence(day: str, hour: int, minute: int = 0) -> datetime:
+    """The next upcoming `day` at that wall-clock time, in US Eastern.
 
     Arithmetic is done on a naive datetime and localized afterwards so that
-    crossing a DST boundary keeps the wall-clock hour the team agreed on.
+    crossing a DST boundary keeps the wall-clock time the team agreed on.
     """
     now = datetime.now(TZ)
     naive_now = now.replace(tzinfo=None)
-    candidate = naive_now.replace(hour=START_HOUR + hour_index, minute=0, second=0, microsecond=0)
+    candidate = naive_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     candidate += timedelta(days=(DAYS.index(day) - candidate.weekday()) % 7)
     # Discord rejects events that start in the past; skip a week if it's too close.
     if candidate <= naive_now + timedelta(minutes=5):
@@ -679,16 +713,46 @@ def date_windows(data: dict, horizon_days: int = 21) -> list[dict]:
         for block in merge_hours(free_on(data, day)):
             # Discord rejects events starting in the past, so drop today's
             # windows that have already begun.
-            if datetime.combine(day, dtime(hour=START_HOUR + block["start"]), tzinfo=TZ) <= now:
+            if window_start(day, START_HOUR + block["start"]) <= now:
                 continue
             windows.append({**block, "date": day, "day": DAYS[day.weekday()]})
     windows.sort(key=lambda w: (-len(w["people"]), -w["span"], w["date"], w["start"]))
     return windows
 
 
-def window_start(day: date, hour_index: int) -> datetime:
-    """Wall-clock start of a slot on a concrete date, in US Eastern."""
-    return datetime.combine(day, dtime(hour=START_HOUR + hour_index), tzinfo=TZ)
+def window_start(day: date, hour: int, minute: int = 0) -> datetime:
+    """A concrete date at a wall-clock time, in US Eastern."""
+    return datetime.combine(day, dtime(hour=hour, minute=minute), tzinfo=TZ)
+
+
+def slot_start(day: date, hour_index: int, minute: int = 0) -> datetime:
+    """Start of an availability slot on a concrete date, in US Eastern."""
+    return window_start(day, START_HOUR + hour_index, minute)
+
+
+def overlapped_slots(hour: int, minute: int, duration_minutes: int) -> list[int]:
+    """Availability hour indices an event at this time actually overlaps.
+
+    Events live on a 15-minute grid while availability is collected per hour, so
+    "who is free then" means "who is free for every hour the event touches".
+    Hours outside the collected 10am-8pm range simply have no data.
+    """
+    start = hour * 60 + minute
+    end = start + duration_minutes
+    return [
+        i
+        for i in range(len(HOUR_LABELS))
+        if (START_HOUR + i) * 60 < end and (START_HOUR + i + 1) * 60 > start
+    ]
+
+
+def attendees_for(data: dict, day: str, hour: int, minute: int, duration_minutes: int) -> list[str]:
+    """Everyone free for *every* availability hour the event runs across."""
+    slots = overlapped_slots(hour, minute, duration_minutes)
+    if not slots:
+        return []
+    free = [set(people_free(data, day, h)) for h in slots]
+    return sorted(set.intersection(*free))
 
 
 def day_totals(data: dict, start: date, end: date) -> dict[str, dict]:
@@ -708,6 +772,62 @@ def day_totals(data: dict, start: date, end: date) -> dict[str, dict]:
             }
         day += timedelta(days=1)
     return out
+
+
+def full_date_label(day: date) -> str:
+    """'Monday, August 10, 2026' -- %-d isn't portable to Windows, hence day."""
+    return f"{DAYS[day.weekday()]}, {day:%B} {day.day}, {day.year}"
+
+
+def day_detail(data: dict, day: date) -> dict:
+    """Everything the dashboard shows for one *specific* date.
+
+    Free hours are computed for this exact date rather than for its weekday, so
+    two Mondays with different away-lists give different answers.
+    """
+    free = free_on(data, day)
+    key = day.isoformat()
+    away = sorted(rec["name"] for rec in data.values() if key in off_dates(rec))
+    hours = [
+        {
+            "index": i,
+            "label": HOUR_LABELS[i],
+            "start": fmt_clock(START_HOUR + i),
+            "end": fmt_clock(START_HOUR + i + 1),
+            "people": free.get(i, []),
+            "count": len(free.get(i, [])),
+        }
+        for i in range(len(HOUR_LABELS))
+    ]
+    windows = [
+        {
+            **block,
+            "count": len(block["people"]),
+            "startLabel": fmt_clock(START_HOUR + block["start"]),
+            "endLabel": fmt_clock(START_HOUR + block["end"] + 1),
+        }
+        for block in merge_hours(free)
+    ]
+    return {
+        "date": key,
+        "weekday": DAYS[day.weekday()],
+        "label": full_date_label(day),
+        "totalPeople": len(data),
+        "freeHours": sum(1 for hour in hours if hour["count"]),
+        "peak": max((hour["count"] for hour in hours), default=0),
+        "hours": hours,
+        "windows": windows,
+        "away": away,
+        "isPast": day < datetime.now(TZ).date(),
+        "inSeason": day <= SEASON_END,
+    }
+
+
+async def dashboard_day(raw_date: str) -> dict | None:
+    """Free hours for one date, for the dashboard's date selector."""
+    if not _valid_date(raw_date or ""):
+        return None
+    return day_detail(load_data(), date.fromisoformat(raw_date))
 
 
 def rank_slots(data: dict) -> list[tuple[tuple[str, int], list[str]]]:
@@ -766,11 +886,17 @@ def help_embed() -> discord.Embed:
     )
     embed.add_field(name="/best", value="Rank the times that work for the most people. Pick one right from the results to create an event.", inline=False)
     embed.add_field(name="/events", value="Every upcoming team event, grouped by date, with RSVP counts.", inline=False)
+    only = f" *{' / '.join(SCHEDULE_ROLE_NAMES)} only.*" if SCHEDULE_ROLE_NAMES else ""
     embed.add_field(
         name="/schedule",
-        value=f"Create a Discord Scheduled Event for a specific day and hour. *{' / '.join(SCHEDULE_ROLE_NAMES)} only.*"
-        if SCHEDULE_ROLE_NAMES
-        else "Create a Discord Scheduled Event for a specific day and hour.",
+        value="Create a Discord Scheduled Event. Start times come in 15-minute steps "
+        "(8:00, 8:15, 8:30, 8:45…) and the length can be as short as 15 minutes." + only,
+        inline=False,
+    )
+    embed.add_field(
+        name="/reschedule",
+        value="Move an existing event to a new date and start time, on the same "
+        "15-minute grid." + only,
         inline=False,
     )
     embed.add_field(name="/help", value="Show this message.", inline=False)
@@ -869,8 +995,9 @@ def no_permission_embed() -> discord.Embed:
 async def create_meeting_event(
     guild: discord.Guild,
     day: str,
-    hour_index: int,
-    duration_hours: int,
+    hour: int,
+    minute: int,
+    duration_minutes: int,
     title: str,
     location: str,
     attendees: list[str],
@@ -878,14 +1005,18 @@ async def create_meeting_event(
 ) -> discord.ScheduledEvent:
     """Create a native Discord Scheduled Event.
 
-    Uses on_date when the caller already knows the exact date (as /best now
-    does); otherwise falls back to the next occurrence of that weekday.
+    hour/minute are wall-clock, on the SLOT_MINUTES grid, so a meeting can start
+    at 8:15 rather than only on the hour. Uses on_date when the caller already
+    knows the exact date (as /best now does); otherwise falls back to the next
+    occurrence of that weekday.
     """
-    start = window_start(on_date, hour_index) if on_date else next_occurrence(day, hour_index)
-    end = start + timedelta(hours=duration_hours)
+    start = (
+        window_start(on_date, hour, minute) if on_date else next_occurrence(day, hour, minute)
+    )
+    end = start + timedelta(minutes=duration_minutes)
 
-    window = hour_range_label(hour_index, hour_index + duration_hours - 1)
-    description = f"Found by /best — {day} {window}.\n"
+    when = f"{full_date_label(start.date())} · {clock_range(start, end)}"
+    description = f"{when} ({fmt_duration(duration_minutes)}).\n"
     if attendees:
         description += f"\n**Free at this time ({len(attendees)}):**\n" + join_names(attendees, limit=800)
     else:
@@ -1016,7 +1147,13 @@ class SlotSelect(discord.ui.Select):
             )
             for i, block in enumerate(blocks)
         ]
-        super().__init__(placeholder="Pick a window to schedule…", options=options, min_values=1, max_values=1)
+        super().__init__(
+            placeholder="Pick a window to schedule…",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         view = cast(ScheduleFromBestView, self.view)
@@ -1024,17 +1161,63 @@ class SlotSelect(discord.ui.Select):
         await interaction.response.edit_message(embed=view.summary(), view=view)
 
 
-class DurationSelect(discord.ui.Select):
-    """Length options, capped to how long the chosen window actually is."""
+def grid_step(total_minutes: int, limit: int = 25) -> int:
+    """Finest step (from SLOT_MINUTES up) that keeps a select within `limit`."""
+    for step in (SLOT_MINUTES, 30, 60, 120):
+        if total_minutes // step <= limit:
+            return step
+    return 120
 
-    def __init__(self, max_hours: int = 1, selected: int = 1, enabled: bool = False):
+
+class StartSelect(discord.ui.Select):
+    """Quarter-hour start times inside the chosen window."""
+
+    def __init__(self, base: datetime | None = None, span_minutes: int = 60,
+                 selected: int = 0, enabled: bool = False):
+        options: list[discord.SelectOption] = []
+        if base is not None:
+            # Leave room for at least one slot of meeting after the start.
+            usable = max(SLOT_MINUTES, span_minutes - SLOT_MINUTES)
+            step = grid_step(usable)
+            for offset in range(0, usable + 1, step):
+                moment = base + timedelta(minutes=offset)
+                options.append(
+                    discord.SelectOption(
+                        label=fmt_clock(moment.hour, moment.minute),
+                        value=str(offset),
+                        default=(offset == selected),
+                    )
+                )
+        if not options:
+            options = [discord.SelectOption(label="—", value="0")]
+        super().__init__(
+            placeholder="Start time" if enabled else "Pick a window first…",
+            options=options,
+            min_values=1,
+            max_values=1,
+            disabled=not enabled,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = cast(ScheduleFromBestView, self.view)
+        view.start_offset = int(self.values[0])
+        view.rebuild()
+        await interaction.response.edit_message(embed=view.summary(), view=view)
+
+
+class DurationSelect(discord.ui.Select):
+    """Length options in 15-minute steps, capped to what's left of the window."""
+
+    def __init__(self, max_minutes: int = 60, selected: int = 60, enabled: bool = False):
+        step = grid_step(max(SLOT_MINUTES, max_minutes))
         options = [
             discord.SelectOption(
-                label=f"{h} hour{'s' if h > 1 else ''}",
-                value=str(h),
-                default=(h == selected),
+                label=fmt_duration(minutes),
+                value=str(minutes),
+                default=(minutes == selected),
             )
-            for h in range(1, max(1, max_hours) + 1)
+            for minutes in range(step, max(step, max_minutes) + 1, step)
         ]
         super().__init__(
             placeholder="Meeting length" if enabled else "Pick a window first…",
@@ -1042,18 +1225,19 @@ class DurationSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             disabled=not enabled,
+            row=2,
         )
 
     async def callback(self, interaction: discord.Interaction):
         view = cast(ScheduleFromBestView, self.view)
-        view.duration_hours = int(self.values[0])
+        view.duration_minutes = int(self.values[0])
         view.rebuild()
         await interaction.response.edit_message(embed=view.summary(), view=view)
 
 
 class CreateEventButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Create Discord event", style=discord.ButtonStyle.green, row=2)
+        super().__init__(label="Create Discord event", style=discord.ButtonStyle.green, row=3)
 
     async def callback(self, interaction: discord.Interaction):
         view = cast(ScheduleFromBestView, self.view)
@@ -1072,17 +1256,19 @@ class CreateEventButton(discord.ui.Button):
             return
 
         block = view.blocks[view.chosen]
+        start = view.start_time()
         await interaction.response.defer(ephemeral=True)
         try:
             event = await create_meeting_event(
                 interaction.guild,
                 block["day"],
-                block["start"],
-                view.duration_hours,
+                start.hour,
+                start.minute,
+                view.duration_minutes,
                 DEFAULT_EVENT_TITLE,
                 DEFAULT_EVENT_LOCATION,
                 block["people"],
-                on_date=block.get("date"),
+                on_date=start.date(),
             )
         except Exception as exc:  # surfaced to the user by respond_to_event_error
             await respond_to_event_error(interaction, exc)
@@ -1103,39 +1289,75 @@ class ScheduleFromBestView(discord.ui.View):
         self.blocks = blocks[:25]  # Discord allows at most 25 select options
         self.total_people = total_people
         self.chosen: int | None = None
-        self.duration_hours = 1
+        self.start_offset = 0          # minutes past the window's first hour
+        self.duration_minutes = 60
         self.rebuild()
 
     def choose(self, index: int) -> None:
         self.chosen = index
         # Default to the whole window -- if everyone is free 1PM-7PM, offering a
         # one-hour meeting by default is the thing the old version got wrong.
-        self.duration_hours = self.blocks[index]["span"]
+        self.start_offset = 0
+        self.duration_minutes = self.blocks[index]["span"] * 60
         self.rebuild()
 
+    def window_base(self) -> datetime:
+        """Wall-clock start of the chosen free window."""
+        block = self.blocks[cast(int, self.chosen)]
+        return (
+            slot_start(block["date"], block["start"])
+            if block.get("date")
+            else next_occurrence(block["day"], START_HOUR + block["start"])
+        )
+
+    def start_time(self) -> datetime:
+        return self.window_base() + timedelta(minutes=self.start_offset)
+
     def rebuild(self) -> None:
-        """Re-add every component so the length options match the chosen window."""
+        """Re-add every component so the time options match the chosen window."""
+        base = None
+        span_minutes = 60
+        if self.chosen is not None:
+            base = self.window_base()
+            span_minutes = self.blocks[self.chosen]["span"] * 60
+            # Keep the selection inside the window after either select changes.
+            self.start_offset = min(self.start_offset, max(0, span_minutes - SLOT_MINUTES))
+            remaining = span_minutes - self.start_offset
+            step = grid_step(max(SLOT_MINUTES, remaining))
+            self.duration_minutes = min(
+                max(step, self.duration_minutes - self.duration_minutes % step), remaining
+            )
+
         self.clear_items()
         self.add_item(SlotSelect(self.blocks, self.total_people))
-        span = self.blocks[self.chosen]["span"] if self.chosen is not None else 1
-        self.add_item(DurationSelect(span, self.duration_hours, enabled=self.chosen is not None))
+        self.add_item(
+            StartSelect(base, span_minutes, self.start_offset, enabled=self.chosen is not None)
+        )
+        self.add_item(
+            DurationSelect(
+                span_minutes - self.start_offset,
+                self.duration_minutes,
+                enabled=self.chosen is not None,
+            )
+        )
         self.add_item(CreateEventButton())
 
     def summary(self) -> discord.Embed:
         # Only ever called once a window has been picked.
         assert self.chosen is not None
         block = self.blocks[self.chosen]
-        start = (
-            window_start(block["date"], block["start"])
-            if block.get("date")
-            else next_occurrence(block["day"], block["start"])
+        start = self.start_time()
+        end = start + timedelta(minutes=self.duration_minutes)
+        embed = base_embed(
+            "Ready to schedule",
+            f"**{full_date_label(start.date())}**\n{clock_range(start, end)}",
+            COLOR_OK,
         )
-        end = start + timedelta(hours=self.duration_hours)
-        embed = base_embed("Ready to schedule", f"**{block['day']} {block['label']}**", COLOR_OK)
         embed.add_field(
             name="Event will run",
             value=f"{discord.utils.format_dt(start, 'F')} → {discord.utils.format_dt(end, 't')}"
-            f"\n({self.duration_hours} of the {block['span']} free hours)",
+            f"\n({fmt_duration(self.duration_minutes)} of the {block['span']}h free window "
+            f"{block['label']})",
             inline=False,
         )
         embed.add_field(
@@ -1223,7 +1445,11 @@ async def dashboard_state() -> dict:
         "hourLabels": HOUR_LABELS,
         "totalPeople": total,
         "today": today.isoformat(),
+        "todayLabel": full_date_label(today),
         "seasonEnd": SEASON_END.isoformat(),
+        # Wall-clock start of each availability hour, so the browser never has
+        # to re-derive "10AM" from an index.
+        "hourStarts": [fmt_clock(START_HOUR + i) for i in range(len(HOUR_LABELS))],
         # Per-date peaks so the calendar can shade real dates, including the
         # ones where someone has marked themselves away.
         "dayTotals": day_totals(data, today, SEASON_END),
@@ -1442,25 +1668,35 @@ async def best(interaction: discord.Interaction, top: app_commands.Range[int, 1,
     await interaction.response.send_message(embed=embed, view=view)
 
 
-@bot.tree.command(name="schedule", description="Create a Discord event for a specific day and hour")
+# Reused by /schedule and /reschedule so both offer exactly the same grid.
+HOUR_CHOICES = [app_commands.Choice(name=fmt_clock(h), value=h) for h in range(24)]
+MINUTE_OPTIONS = [
+    app_commands.Choice(name=f":{m:02d}", value=m) for m in MINUTE_CHOICES
+]
+DURATION_CHOICES = [
+    app_commands.Choice(name=fmt_duration(m), value=m) for m in DURATION_MINUTES
+]
+
+
+@bot.tree.command(name="schedule", description="Create a Discord event at any 15-minute start time")
 @app_commands.describe(
     day="Day of the week for the meeting",
-    hour="Which hourly slot the meeting starts in",
-    duration="How many hours the meeting runs (default 1)",
+    hour="Hour the meeting starts",
+    minute="Minutes past the hour (15-minute steps)",
+    duration="How long the meeting runs",
     title="Event title (default 'FTC Team Meeting')",
     location="Where the meeting happens",
 )
 # Split across two decorators: choices() binds a single type variable per call,
 # so str choices and int choices can't share one invocation.
 @app_commands.choices(day=[app_commands.Choice(name=d, value=d) for d in DAYS])
-@app_commands.choices(
-    hour=[app_commands.Choice(name=HOUR_LABELS[i], value=i) for i in range(len(HOUR_LABELS))]
-)
+@app_commands.choices(hour=HOUR_CHOICES, minute=MINUTE_OPTIONS, duration=DURATION_CHOICES)
 async def schedule(
     interaction: discord.Interaction,
     day: app_commands.Choice[str],
     hour: app_commands.Choice[int],
-    duration: app_commands.Range[int, 1, 8] = 1,
+    minute: app_commands.Choice[int] | None = None,
+    duration: app_commands.Choice[int] | None = None,
     title: str = DEFAULT_EVENT_TITLE,
     location: str = DEFAULT_EVENT_LOCATION,
 ):
@@ -1475,26 +1711,162 @@ async def schedule(
         await interaction.response.send_message(embed=no_permission_embed(), ephemeral=True)
         return
 
+    start_minute = minute.value if minute else 0
+    duration_minutes = duration.value if duration else 60
+
     await interaction.response.defer()
     data = load_data()
-    # Everyone free for the whole requested span, not just its first hour.
-    attendees = sorted(
-        set.intersection(
-            *(
-                set(people_free(data, day.value, h))
-                for h in range(hour.value, min(hour.value + duration, len(HOUR_LABELS)))
-            )
-        )
-    )
+    # Everyone free for every hour the meeting touches, not just its first.
+    attendees = attendees_for(data, day.value, hour.value, start_minute, duration_minutes)
     try:
         event = await create_meeting_event(
-            interaction.guild, day.value, hour.value, duration, title, location, attendees
+            interaction.guild,
+            day.value,
+            hour.value,
+            start_minute,
+            duration_minutes,
+            title,
+            location,
+            attendees,
         )
     except Exception as exc:  # surfaced to the user by respond_to_event_error
         await respond_to_event_error(interaction, exc)
         return
 
     await interaction.followup.send(embed=event_created_embed(event, attendees))
+
+
+async def event_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Upcoming events, labelled with their exact date and start time."""
+    if interaction.guild is None:
+        return []
+    cutoff = datetime.now(TZ) - timedelta(hours=1)
+    # allow_stale: autocomplete has the same ~3s budget as any interaction, and
+    # fetch_events can take far longer than that against the Discord API.
+    upcoming = sorted(
+        (
+            event
+            for event in await fetch_events(interaction.guild, allow_stale=True)
+            if event.start_time and event.start_time.astimezone(TZ) >= cutoff
+        ),
+        key=lambda e: e.start_time,
+    )
+    needle = current.casefold()
+    out = []
+    for event in upcoming:
+        start = event.start_time.astimezone(TZ)
+        label = f"{event.name} — {start:%a %b} {start.day} · {fmt_clock(start.hour, start.minute)}"
+        if needle in label.casefold():
+            out.append(app_commands.Choice(name=label[:100], value=str(event.id)))
+    return out[:25]
+
+
+@bot.tree.command(name="reschedule", description="Move an existing event to a new 15-minute start time")
+@app_commands.describe(
+    event="Which upcoming event to move",
+    hour="New start hour",
+    minute="Minutes past the hour (15-minute steps)",
+    duration="New length (leave blank to keep the current one)",
+    date="New date as YYYY-MM-DD (leave blank to keep the current one)",
+)
+@app_commands.choices(hour=HOUR_CHOICES, minute=MINUTE_OPTIONS, duration=DURATION_CHOICES)
+@app_commands.autocomplete(event=event_autocomplete)
+async def reschedule(
+    interaction: discord.Interaction,
+    event: str,
+    hour: app_commands.Choice[int],
+    minute: app_commands.Choice[int] | None = None,
+    duration: app_commands.Choice[int] | None = None,
+    date: str = "",
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            embed=base_embed("Server only", "Scheduled events live in a server, not in DMs.", COLOR_WARN),
+            ephemeral=True,
+        )
+        return
+
+    if not can_schedule(interaction.user):
+        await interaction.response.send_message(embed=no_permission_embed(), ephemeral=True)
+        return
+
+    if not event.isdigit():
+        await interaction.response.send_message(
+            embed=base_embed(
+                "Pick an event from the list",
+                "Start typing and choose one of the suggestions so I know which event to move.",
+                COLOR_WARN,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    if date and not _valid_date(date):
+        await interaction.response.send_message(
+            embed=base_embed("That date didn't parse", "Use the `YYYY-MM-DD` form, for example `2026-08-10`.", COLOR_WARN),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+    scheduled = await fetch_events(interaction.guild, force=True)
+    target = discord.utils.get(scheduled, id=int(event))
+    if target is None or target.start_time is None:
+        await interaction.followup.send(
+            embed=base_embed("I couldn't find that event", "It may have been cancelled already.", COLOR_WARN)
+        )
+        return
+
+    current_start = target.start_time.astimezone(TZ)
+    current_end = (target.end_time or current_start + timedelta(hours=1)).astimezone(TZ)
+    on_date = date_cls.fromisoformat(date) if date else current_start.date()
+    duration_minutes = (
+        duration.value
+        if duration
+        else max(SLOT_MINUTES, round((current_end - current_start).total_seconds() / 60))
+    )
+
+    start = window_start(on_date, hour.value, minute.value if minute else 0)
+    end = start + timedelta(minutes=duration_minutes)
+    if start <= datetime.now(TZ) + timedelta(minutes=1):
+        await interaction.followup.send(
+            embed=base_embed(
+                "That time has already passed",
+                f"{full_date_label(on_date)} at {fmt_clock(start.hour, start.minute)} is in the past — "
+                "Discord only accepts future start times.",
+                COLOR_WARN,
+            )
+        )
+        return
+
+    try:
+        await target.edit(start_time=start, end_time=end)
+    except Exception as exc:  # surfaced to the user by respond_to_event_error
+        await respond_to_event_error(interaction, exc)
+        return
+
+    _events_cache.pop(interaction.guild.id, None)  # next read picks up the new time
+    data = load_data()
+    attendees = attendees_for(data, DAYS[on_date.weekday()], start.hour, start.minute, duration_minutes)
+    embed = base_embed("Event moved", f"**{target.name}**", COLOR_OK)
+    embed.add_field(
+        name="Was",
+        value=f"{full_date_label(current_start.date())}\n{clock_range(current_start, current_end)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="Now",
+        value=f"{full_date_label(on_date)}\n{clock_range(start, end)} ({fmt_duration(duration_minutes)})",
+        inline=True,
+    )
+    embed.add_field(name="Starts", value=discord.utils.format_dt(start, "F"), inline=False)
+    embed.add_field(
+        name=f"Expected free ({len(attendees)})", value=join_names(attendees), inline=False
+    )
+    embed.add_field(name="RSVP", value=f"[Open in the Events tab]({target.url})", inline=False)
+    await interaction.followup.send(embed=embed)
 
 
 async def run_bot() -> None:
@@ -1513,6 +1885,7 @@ async def run_bot() -> None:
             DASHBOARD_PORT,
             get_user=dashboard_get_user,
             save_user=dashboard_save_user,
+            get_day=dashboard_day,
         )
     try:
         await bot.start(cast(str, TOKEN))

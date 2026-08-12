@@ -184,6 +184,7 @@ PAGE = """<!doctype html>
     border-radius: 999px; padding: 2px 9px; font-size: 11.5px; white-space: nowrap;
   }
   .bfoot .who { color: var(--muted); font-size: 12.5px; margin: 0; }
+  .bcard.sel { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue) inset; }
   .cards.dim .bcard { opacity: .62; }
   .cards.dim .btime { color: var(--muted); }
 
@@ -199,12 +200,51 @@ PAGE = """<!doctype html>
     border: 1px solid transparent; position: relative;
   }
   .mday.pad { background: transparent; }
+  .mday.pick { cursor: pointer; }
   .mday.today { border-color: var(--accent); color: var(--accent); font-weight: 700; }
   .mday.has { color: #06281d; font-weight: 650; }
   .mday.ev::after {
     content: ""; position: absolute; bottom: 3px; width: 4px; height: 4px;
     border-radius: 50%; background: var(--accent);
   }
+
+  /* ---------- selected day ---------- */
+  .cell { cursor: pointer; }
+  .cell.pad { cursor: default; }
+  .cell.sel, .mday.sel {
+    border-color: var(--blue);
+    box-shadow: 0 0 0 2px var(--blue) inset;
+  }
+  .mday.sel { color: var(--text); font-weight: 700; }
+  .daybar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 16px; }
+  .daybar input[type="date"] {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 9px; padding: 7px 11px; font: inherit; font-size: 14px;
+    color-scheme: dark;
+  }
+  .daybar input[type="date"]:focus { outline: none; border-color: var(--accent); }
+  .dayhead {
+    background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--blue);
+    border-radius: var(--radius); padding: 15px 18px; margin-bottom: 18px;
+  }
+  .dayhead .lbl {
+    color: var(--muted); font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+  }
+  .dayhead .big { font-size: 24px; font-weight: 700; margin: 3px 0 9px; }
+  .dayhead .facts { display: flex; gap: 8px; flex-wrap: wrap; }
+  .hours { display: grid; gap: 6px; }
+  .hrow {
+    display: grid; grid-template-columns: 132px 54px 1fr; align-items: center; gap: 12px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 8px 13px;
+  }
+  .hrow.none { opacity: .45; }
+  .hrow .when { font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
+  .hrow .num { font-size: 13px; color: var(--muted); text-align: right; }
+  .hrow .num b { color: var(--text); font-size: 15px; }
+  .hrow .bar { height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; }
+  .hrow .bar i { display: block; height: 100%; background: var(--green); border-radius: 4px; }
+  .hrow .who { grid-column: 1 / -1; color: var(--muted); font-size: 12px; }
 
   /* ---------- personal editor ---------- */
   .namebar { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -246,6 +286,7 @@ PAGE = """<!doctype html>
       <div class="label">Views</div>
       <button class="nav" data-view="me" id="nav-me" hidden><span class="ic">✏️</span> My availability</button>
       <button class="nav on" data-view="cal"><span class="ic">📅</span> Calendar</button>
+      <button class="nav" data-view="day"><span class="ic">🕐</span> Selected day</button>
       <button class="nav" data-view="season"><span class="ic">🗓️</span> Season</button>
       <button class="nav" data-view="heat"><span class="ic">📊</span> Weekly pattern</button>
       <button class="nav" data-view="best"><span class="ic">⭐</span> Best times</button>
@@ -278,6 +319,16 @@ PAGE = """<!doctype html>
                          <div>Fri</div><div>Sat</div><div>Sun</div></div>
         <div class="grid" id="grid"></div>
       </section>
+      <section class="view" id="v-day">
+        <div class="daybar">
+          <button class="btn" id="d-prev">‹ Previous day</button>
+          <label for="datepick" class="hint" style="margin:0">Date</label>
+          <input type="date" id="datepick">
+          <button class="btn pri" id="d-today">Today</button>
+          <button class="btn" id="d-next">Next day ›</button>
+        </div>
+        <div id="daybody"></div>
+      </section>
       <section class="view" id="v-season"><div class="months" id="months"></div></section>
       <section class="view" id="v-me">
         <div class="namebar">
@@ -297,7 +348,10 @@ PAGE = """<!doctype html>
           <span id="savemsg" class="hint"></span>
         </div>
       </section>
-      <section class="view" id="v-heat"><div class="heatwrap"><table class="hm" id="hm"></table></div></section>
+      <section class="view" id="v-heat">
+        <p class="hint" id="heat-hint"></p>
+        <div class="heatwrap"><table class="hm" id="hm"></table></div>
+      </section>
       <section class="view" id="v-best"><div id="best"></div></section>
       <section class="view" id="v-team"><div class="cards" id="team"></div></section>
     </div>
@@ -317,7 +371,20 @@ const hue = (s) => ACCENTS[Math.abs([...String(s)].reduce((a,c)=>a+c.charCodeAt(
 const clock = (iso) => new Date(iso).toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
 const ymd = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 
-const VIEWS = ["cal", "season", "heat", "best", "team", "me"];
+// Noon keeps the parse away from midnight, where a DST shift could roll a
+// date-only string back into the previous day.
+const atNoon = (key) => new Date(key + "T12:00:00");
+// "Monday, August 10, 2026" -- the whole point of the date selector.
+const fullLabel = (key) => atNoon(key).toLocaleDateString([],
+  {weekday:"long", month:"long", day:"numeric", year:"numeric"});
+
+const VIEWS = ["cal", "day", "season", "heat", "best", "team", "me"];
+
+// The date the whole dashboard is focused on. Free hours, the day view and the
+// calendar highlight all follow it, and it survives a refresh via the hash.
+let selected = null;
+let dayInfo = null;
+let dayReq = 0;   // guards against a slow response for an older date landing last
 // Present only on a personal edit link; the plain public URL has no key and
 // therefore never gets the editor.
 const KEY = new URLSearchParams(location.search).get("key");
@@ -328,9 +395,22 @@ function setView(v, push) {
   view = VIEWS.includes(v) ? v : "cal";
   document.querySelectorAll(".nav").forEach(n => n.classList.toggle("on", n.dataset.view === view));
   document.querySelectorAll(".view").forEach(s => s.classList.toggle("on", s.id === "v-" + view));
-  ["prev","today","next"].forEach(id => $(id).style.display = view === "cal" ? "" : "none");
+  const stepper = view === "cal" || view === "day";
+  ["prev","today","next"].forEach(id => $(id).style.display = stepper ? "" : "none");
   if (push) location.hash = view;   // deep-linkable, and survives a refresh
   render();
+}
+
+// The three top-bar buttons move whichever unit the current view is about.
+function step(delta) {
+  if (view === "day") shiftSelected(delta);
+  else cursor = new Date(cursor.getFullYear(), cursor.getMonth() + delta, 1);
+  render();
+}
+
+function jumpToday() {
+  if (view === "day") setSelected(state ? state.today : iso(new Date()));
+  else { cursor = new Date(); render(); }
 }
 
 function render() {
@@ -340,9 +420,12 @@ function render() {
   $("s-events").textContent = state.events.length;
   const top = state.best[0];
   $("s-best").textContent = top ? `${top.count}/${state.totalPeople}` : "—";
-  $("s-best-sub").textContent = top ? `${top.day} ${top.label}` : "no data yet";
+  $("s-best-sub").textContent = top
+    ? `${atNoon(top.date).toLocaleDateString([], {weekday:"short", month:"short", day:"numeric"})} · ${top.label}`
+    : "no data yet";
 
-  if (view === "cal") renderMonth();
+  if (view === "day") renderDay();
+  else if (view === "cal") renderMonth();
   else if (view === "season") renderSeason();
   else if (view === "heat") renderHeat();
   else if (view === "best") renderBest();
@@ -351,6 +434,112 @@ function render() {
 }
 
 const iso = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+
+// ---------- selected date ----------
+function setSelected(key, {show = false} = {}) {
+  if (!key) return;
+  const changed = key !== selected;
+  selected = key;
+  if ($("datepick").value !== key) $("datepick").value = key;
+  if (changed) { dayInfo = null; loadDay(); }
+  if (show) setView("day", true); else render();
+}
+
+function shiftSelected(days) {
+  const d = atNoon(selected || state.today);
+  d.setDate(d.getDate() + days);
+  setSelected(iso(d));
+}
+
+// Free hours are asked for by exact date, so two Mondays with different
+// away-lists give different answers. Re-run on every poll as well, so the
+// numbers on screen stay live without the user touching anything.
+async function loadDay() {
+  if (!selected) return;
+  const token = ++dayReq;
+  let next;
+  try {
+    const r = await fetch("/api/day?date=" + encodeURIComponent(selected), {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    next = await r.json();
+  } catch (e) {
+    next = {date: selected, error: "could not load that date"};
+  }
+  if (token !== dayReq) return;    // a newer date was picked while we waited
+  dayInfo = next;
+  if (view === "day") render();
+}
+
+function eventsOn(key) {
+  return state.events.filter(e => iso(new Date(e.start)) === key);
+}
+
+function renderDay() {
+  const key = selected || state.today;
+  $("title").textContent = fullLabel(key);
+  const info = dayInfo && dayInfo.date === key ? dayInfo : null;
+
+  let html = `<div class="dayhead">
+    <div class="lbl">Selected date</div>
+    <div class="big">${esc(info ? info.label : fullLabel(key))}</div>
+    <div class="facts">
+      <span class="pill">${key}</span>
+      ${key === state.today ? `<span class="pill">Today</span>` : ""}
+      ${info ? `<span class="pill">${info.peak}/${info.totalPeople} free at best</span>
+                <span class="pill">${info.freeHours} free hour${info.freeHours === 1 ? "" : "s"}</span>` : ""}
+      ${info && info.away.length ? `<span class="pill">${info.away.length} away</span>` : ""}
+    </div>
+  </div>`;
+
+  if (!info) {
+    html += `<div class="empty">${dayInfo && dayInfo.error ? esc(dayInfo.error) : "Loading that date…"}</div>`;
+    $("daybody").innerHTML = html;
+    return;
+  }
+
+  const evs = eventsOn(key);
+  if (evs.length) {
+    html += `<h3 class="sec">Events on this date (${evs.length})</h3><div class="cards">` +
+      evs.map(e => `<div class="card" style="border-left-color:${hue(e.name)}">
+        <h4>${esc(e.name)}</h4>
+        <div class="meta">${clock(e.start)} – ${clock(e.end)} · 👥 ${e.count}</div>
+        ${e.location ? `<div class="who">📍 ${esc(e.location)}</div>` : ""}
+      </div>`).join("") + `</div>`;
+  }
+
+  html += `<h3 class="sec">Free hours on ${esc(info.label)}</h3>`;
+  if (!info.peak) {
+    html += `<div class="empty">Nobody is free on this date.</div>`;
+  } else {
+    html += `<div class="hours">` + info.hours.map(h => {
+      const pct = info.totalPeople ? Math.round(h.count / info.totalPeople * 100) : 0;
+      return `<div class="hrow${h.count ? "" : " none"}">
+        <div class="when">${h.start} – ${h.end}</div>
+        <div class="num"><b>${h.count}</b>/${info.totalPeople}</div>
+        <div class="bar"><i style="width:${pct}%"></i></div>
+        ${h.count ? `<div class="who">${esc(h.people.join(", "))}</div>` : ""}
+      </div>`;
+    }).join("") + `</div>`;
+
+    html += `<h3 class="sec">Longest windows</h3><div class="cards">` +
+      info.windows.map(w => `<div class="bcard">
+        <div class="bhead">
+          <div>
+            <div class="bwhen">${w.startLabel} – ${w.endLabel}</div>
+            <div class="btime">${w.span} hour window</div>
+          </div>
+          <div class="bcount"><b>${w.count}<span>/${info.totalPeople}</span></b><span>free</span></div>
+        </div>
+        <div class="bfoot"><span class="who">${esc(w.people.join(", "))}</span></div>
+      </div>`).join("") + `</div>`;
+  }
+
+  if (info.away.length) {
+    html += `<h3 class="sec">Away this date (${info.away.length})</h3>
+             <p class="hint">${esc(info.away.join(", "))}</p>`;
+  }
+  $("daybody").innerHTML = html;
+}
 
 // One month block, shared by the season overview and the days-off picker.
 function monthBlock(y, m, cell) {
@@ -384,13 +573,15 @@ function renderSeason() {
   $("months").innerHTML = seasonMonths().map(([y, m]) => monthBlock(y, m, (date, d) => {
     const key = iso(date);
     const t = totals[key];
-    const cls = ["mday"];
+    const cls = ["mday", "pick"];
     if (key === state.today) cls.push("today");
+    if (key === selected) cls.push("sel");
     if (t) cls.push("has");
     if (evDays.has(key)) cls.push("ev");
     const bg = t ? `background:rgba(52,211,153,${(0.18 + 0.72 * t.peak / peak).toFixed(2)});` : "";
     const tip = t ? `${t.peak}/${state.totalPeople} free · ${t.label}` : "nobody free";
-    return `<div class="${cls.join(" ")}" style="${bg}" title="${key} — ${tip}">${d}</div>`;
+    return `<div class="${cls.join(" ")}" data-date="${key}" style="${bg}"
+      title="${fullLabel(key)} — ${tip}">${d}</div>`;
   })).join("");
 }
 
@@ -520,43 +711,47 @@ function renderMonth() {
     const d = new Date(e.start);
     if (d.getFullYear() === y && d.getMonth() === m) (byDay[d.getDate()] ||= []).push(e);
   });
-  // recurring availability peaks, keyed by weekday
-  const peak = {};
-  state.best.forEach(b => {
-    const wd = state.days.indexOf(b.day);
-    if (!peak[wd] || b.count > peak[wd].count) peak[wd] = b;
-  });
-  const maxCount = Math.max(1, ...state.best.map(b => b.count));
+  // Availability per *date*, not per weekday, so a day someone marked
+  // themselves away on reads differently from the same weekday next week.
+  const totals = state.dayTotals || {};
+  const maxCount = Math.max(1, ...Object.values(totals).map(t => t.peak));
 
   let html = "";
   for (let i = 0; i < lead; i++) html += `<div class="cell pad"></div>`;
   for (let d = 1; d <= days; d++) {
     const date = new Date(y, m, d);
-    const wd = (date.getDay() + 6) % 7;
+    const key = iso(date);
     const evs = byDay[d] || [];
-    const p = peak[wd];
+    const p = totals[key];
     const isToday = ymd(date) === todayKey;
 
     let inner = `<div class="n">${d}</div>`;
     evs.slice(0, 2).forEach(e => {
       inner += `<div class="chip" style="border-left-color:${hue(e.name)}">` +
-               `${esc(e.name)}<time>${clock(e.start)} · 👥 ${e.count}</time></div>`;
+               `${esc(e.name)}<time>${clock(e.start)}–${clock(e.end)} · 👥 ${e.count}</time></div>`;
     });
     if (evs.length > 2) inner += `<div class="more">+${evs.length - 2} more</div>`;
     if (!evs.length && p) {
-      inner += `<div class="chip p">${p.count}/${state.totalPeople} free<time>${p.label}</time></div>`;
+      inner += `<div class="chip p">${p.peak}/${state.totalPeople} free<time>${p.label}</time></div>`;
     }
     if (p) {
-      inner += `<div class="heat" style="width:${Math.round(p.count / maxCount * 100)}%;` +
-               `opacity:${0.25 + 0.65 * (p.count / maxCount)}"></div>`;
+      inner += `<div class="heat" style="width:${Math.round(p.peak / maxCount * 100)}%;` +
+               `opacity:${0.25 + 0.65 * (p.peak / maxCount)}"></div>`;
     }
-    html += `<div class="cell${isToday ? " today" : ""}">${inner}</div>`;
+    html += `<div class="cell${isToday ? " today" : ""}${key === selected ? " sel" : ""}"
+      data-date="${key}" title="${fullLabel(key)}">${inner}</div>`;
   }
   $("grid").innerHTML = html;
 }
 
 function renderHeat() {
-  $("title").textContent = "Team availability";
+  // Deliberately weekday-shaped, and labelled as such: the numbers here are the
+  // standing weekly pattern, not what a particular date works out to.
+  $("title").textContent = "Weekly pattern";
+  $("heat-hint").innerHTML =
+    `The standing weekly arrangement — it ignores days people marked themselves away. ` +
+    `For one exact date, open <b>Selected day</b>` +
+    (selected ? ` (currently ${esc(fullLabel(selected))})` : "") + `.`;
   const max = Math.max(1, ...Object.values(state.counts).flatMap(o => Object.values(o)));
   let html = "<tr><th></th>" + state.days.map(d => `<th>${d.slice(0,3)}</th>`).join("") + "</tr>";
   state.hourLabels.forEach((label, h) => {
@@ -586,12 +781,12 @@ function renderBest() {
 
   const card = (b, i) => {
     const pct = Math.round(b.count / state.totalPeople * 100);
-    const d = new Date(b.date + "T12:00:00");
     return `
-    <div class="bcard${i === 0 ? " win" : ""}">
+    <div class="bcard${i === 0 ? " win" : ""}${b.date === selected ? " sel" : ""}"
+         data-date="${b.date}" title="Open ${fullLabel(b.date)}" style="cursor:pointer">
       <div class="bhead">
         <div>
-          <div class="bwhen">${b.day}, ${d.toLocaleDateString([], {month:"long", day:"numeric"})}</div>
+          <div class="bwhen">${fullLabel(b.date)}</div>
           <div class="btime">${b.label}</div>
         </div>
         <div class="bcount"><b>${b.count}<span>/${state.totalPeople}</span></b><span>free</span></div>
@@ -631,18 +826,39 @@ async function poll() {
     const r = await fetch("/api/state", {cache: "no-store"});
     if (!r.ok) throw new Error(r.status);
     state = await r.json();
+    // Default to today, but never move a date the user has chosen.
+    if (!selected) { selected = state.today; $("datepick").value = selected; }
     $("upd").textContent = "updated " + new Date().toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
     render();
+    loadDay();     // keep the selected date's free hours as live as everything else
   } catch (e) {
     $("upd").textContent = "bot offline — retrying";
   }
 }
 
 document.querySelectorAll(".nav").forEach(n => n.onclick = () => setView(n.dataset.view, true));
-$("prev").onclick = () => { cursor = new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1); render(); };
-$("next").onclick = () => { cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1); render(); };
-$("today").onclick = () => { cursor = new Date(); render(); };
+$("prev").onclick = () => step(-1);
+$("next").onclick = () => step(1);
+$("today").onclick = jumpToday;
 addEventListener("hashchange", () => setView(location.hash.slice(1), false));
+
+// Any date anywhere in the dashboard is a way to select that date.
+$("grid").onclick = (e) => {
+  const cell = e.target.closest(".cell[data-date]");
+  if (cell) setSelected(cell.dataset.date, {show: true});
+};
+$("months").onclick = (e) => {
+  const cell = e.target.closest(".mday[data-date]");
+  if (cell) setSelected(cell.dataset.date, {show: true});
+};
+$("best").onclick = (e) => {
+  const cell = e.target.closest(".bcard[data-date]");
+  if (cell) setSelected(cell.dataset.date, {show: true});
+};
+$("datepick").onchange = () => setSelected($("datepick").value);
+$("d-prev").onclick = () => shiftSelected(-1);
+$("d-next").onclick = () => shiftSelected(1);
+$("d-today").onclick = () => setSelected(state ? state.today : iso(new Date()));
 
 $("ed").onclick = (e) => {
   const cell = e.target.closest("td[data-day]");
@@ -678,12 +894,16 @@ async def start_dashboard(
     port: int,
     get_user: Callable[[str], Awaitable[dict | None]] | None = None,
     save_user: Callable[[str, dict, list, str | None], Awaitable[dict | None]] | None = None,
+    get_day: Callable[[str], Awaitable[dict | None]] | None = None,
 ) -> web.AppRunner | None:
     """Serve the dashboard on the running event loop. Returns None if it can't bind.
 
     get_user/save_user back the personal editor. Both take an edit key and
     return None when it doesn't check out, which the routes turn into a 403 --
     the public link can read everything but can't write anything.
+
+    get_day answers the date selector: free hours for one specific date, which
+    is too much data to ship for every date in the season up front.
     """
     app = web.Application()
 
@@ -705,6 +925,18 @@ async def start_dashboard(
         except Exception:
             log.exception("Failed to build dashboard state")
             return web.json_response({"error": "internal"}, status=500)
+
+    async def day(request: web.Request) -> web.Response:
+        if get_day is None:
+            return web.json_response({"error": "unavailable"}, status=404)
+        try:
+            result = await get_day(request.query.get("date", ""))
+        except Exception:
+            log.exception("Failed to build the day view")
+            return web.json_response({"error": "internal"}, status=500)
+        if result is None:
+            return web.json_response({"error": "bad date"}, status=400)
+        return web.json_response(result)
 
     async def me_get(request: web.Request) -> web.Response:
         if get_user is None:
@@ -746,6 +978,7 @@ async def start_dashboard(
         # web.get also answers HEAD, which is what most uptime monitors send.
         web.get("/health", health),
         web.get("/api/state", state),
+        web.get("/api/day", day),
         web.get("/api/me", me_get),
         web.post("/api/me", me_post),
     ])
