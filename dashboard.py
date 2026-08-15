@@ -261,15 +261,49 @@ PAGE = """<!doctype html>
   .ed td.on { background: var(--green); color: #06281d; font-weight: 700; border-color: transparent; }
   .ed th.col { cursor: pointer; }
   .ed th.col:hover { color: var(--text); text-decoration: underline; }
-  /* one toggle per hour, for the date-specific editor */
-  .slots { display: grid; gap: 7px; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); }
-  .slot {
-    background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
-    border-radius: 9px; padding: 9px 11px; cursor: pointer; font: inherit;
-    font-size: 13.5px; text-align: left; font-variant-numeric: tabular-nums;
+  /* ---------- week grid: one column per real date ---------- */
+  .weekwrap { overflow-x: auto; }
+  .week {
+    display: grid; grid-template-columns: 76px repeat(7, minmax(74px, 1fr)); gap: 4px;
+    min-width: 620px;
+    /* the grid is painted by dragging, so the browser must not treat a drag
+       across it as a scroll gesture */
+    touch-action: none; user-select: none;
   }
-  .slot:hover { border-color: var(--muted); color: var(--text); }
-  .slot.on { background: var(--green); color: #06281d; font-weight: 700; border-color: transparent; }
+  .wk-h { text-align: center; padding: 2px 0 7px; position: relative; }
+  .wk-h .dw { color: var(--muted); font-size: 10.5px; letter-spacing: .07em; }
+  .wk-h .dd { font-size: 13.5px; font-weight: 650; }
+  .wk-h.today .dw, .wk-h.today .dd { color: var(--accent); }
+  .wk-h.pick { cursor: pointer; }
+  .wk-h.pick:hover .dd { text-decoration: underline; }
+  .wk-reset {
+    background: none; border: none; color: var(--blue); cursor: pointer;
+    font: inherit; font-size: 11px; padding: 0; line-height: 1;
+  }
+  .wk-reset:hover { text-decoration: underline; }
+  .wk-t {
+    color: var(--muted); font-size: 11px; text-align: right; padding-right: 7px;
+    line-height: 30px; white-space: nowrap; font-variant-numeric: tabular-nums;
+  }
+  .wk-c {
+    height: 30px; border-radius: 6px; background: var(--panel-2);
+    border: 1px solid var(--line); cursor: pointer;
+  }
+  .wk-c:hover { border-color: var(--muted); }
+  /* two tones: the faded one is inherited from the weekly pattern, the solid
+     one was set for this date specifically */
+  .wk-c.on { border-color: transparent; background: rgba(52,211,153,.42); }
+  .wk-c.on.own { background: var(--green); }
+  .wk-c.away { background: rgba(251,113,133,.22); border-color: transparent; cursor: not-allowed; }
+  .wk-c.past { opacity: .28; pointer-events: none; }
+  .wk-c.out { visibility: hidden; pointer-events: none; }
+  .key {
+    display: inline-block; width: 11px; height: 11px; border-radius: 3px;
+    vertical-align: -1px; margin: 0 3px 0 10px;
+  }
+  .key.k-week { background: rgba(52,211,153,.42); }
+  .key.k-date { background: var(--green); }
+  .key.k-away { background: rgba(251,113,133,.22); }
   .ovrow {
     display: flex; align-items: center; justify-content: space-between; gap: 12px;
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
@@ -355,24 +389,25 @@ PAGE = """<!doctype html>
         </div>
         <div class="tabs">
           <button class="btn pri" id="tab-week">Weekly hours</button>
-          <button class="btn" id="tab-dates">A specific date</button>
+          <button class="btn" id="tab-dates">Specific dates</button>
           <button class="btn" id="tab-off">Days I'm away</button>
         </div>
         <p class="hint" id="me-hint"></p>
         <div id="pane-week"><div class="heatwrap"><table class="hm ed" id="ed"></table></div></div>
         <div id="pane-dates" hidden>
           <div class="daybar">
-            <button class="btn" id="ov-prev">‹</button>
-            <input type="date" id="ovdate">
-            <button class="btn" id="ov-next">›</button>
-            <span id="ov-state" class="hint" style="margin:0"></span>
+            <button class="btn" id="wk-prev">‹ Previous week</button>
+            <button class="btn pri" id="wk-today">This week</button>
+            <button class="btn" id="wk-next">Next week ›</button>
+            <span id="wk-range" class="hint" style="margin:0"></span>
           </div>
-          <div id="ov-slots" class="slots"></div>
-          <div class="savebar" style="margin-top:14px">
-            <button class="btn" id="ov-copy">Start from my weekly hours</button>
-            <button class="btn" id="ov-none">I'm free for none of it</button>
-            <button class="btn" id="ov-clear">Use my weekly hours instead</button>
-          </div>
+          <p class="hint" id="wk-legend">
+            <span class="key k-week"></span> from your weekly hours
+            <span class="key k-date"></span> set for this date
+            <span class="key k-away"></span> away all day
+            — click or drag to paint, click a date to fill the whole day.
+          </p>
+          <div class="weekwrap"><div class="week" id="week"></div></div>
           <h3 class="sec">Dates with their own hours</h3>
           <div id="ov-list"></div>
         </div>
@@ -425,7 +460,8 @@ let dayReq = 0;   // guards against a slow response for an older date landing la
 const KEY = new URLSearchParams(location.search).get("key");
 let mine = null;
 let mePane = "week";
-let ovDate = null;   // which date the "A specific date" tab is editing
+let wkStart = null;  // Monday of the week the date grid is showing
+let paintTo = null;  // during a drag: the value being painted into each cell
 
 function setView(v, push) {
   view = VIEWS.includes(v) ? v : "cal";
@@ -526,8 +562,8 @@ function renderDay() {
       ${info && info.away.length ? `<span class="pill">${info.away.length} away</span>` : ""}
       ${info && (info.custom || []).length ? `<span class="pill">${info.custom.length} on date-specific hours</span>` : ""}
     </div>
-    ${KEY ? `<div style="margin-top:11px">
-      <button class="btn" id="edit-this">Set my hours for this date</button></div>` : ""}
+    ${KEY && key >= state.today && key <= state.seasonEnd ? `<div style="margin-top:11px">
+      <button class="btn" data-edit-date="${key}">Set my hours for this date</button></div>` : ""}
   </div>`;
 
   if (!info) {
@@ -583,9 +619,6 @@ function renderDay() {
              <p class="hint">${esc(info.away.join(", "))}</p>`;
   }
   $("daybody").innerHTML = html;
-
-  const edit = $("edit-this");
-  if (edit) edit.onclick = () => { setOvDate(key); setPane("dates"); setView("me", true); };
 }
 
 // One month block, shared by the season overview and the days-off picker.
@@ -644,7 +677,7 @@ async function loadMine() {
   if (mine && !mine.error) {
     mine.avail = mine.avail || {};
     mine.dates = mine.dates || {};
-    if (!ovDate) ovDate = mine.today || state?.today || iso(new Date());
+    if (!wkStart) wkStart = mondayOf(mine.today || state?.today || iso(new Date()));
   }
 }
 
@@ -660,10 +693,10 @@ function renderMe() {
   $("title").textContent = "Editing " + mine.name;
   if ($("myname") !== document.activeElement) $("myname").value = mine.name === "Unknown" ? "" : mine.name;
   renderOff();
-  renderOverrides();
+  renderWeek();
   $("me-hint").textContent = {
     off: "Your weekly hours apply every week. Click any date you're away and you'll be left out of that day only.",
-    dates: "For one date only — free 5-8 this Tuesday but 3-4 the next. These hours replace your weekly ones on that date and change nothing else.",
+    dates: "Pick your free times on real dates — free 5-8 this Tuesday but 3-4 the next. Whatever you paint here replaces your weekly hours on that date only.",
     week: "Click any slot to mark yourself free. Click a day name to toggle the whole column.",
   }[mePane];
   if (mePane !== "week") return;
@@ -702,84 +735,137 @@ function toggleOff(key) {
   renderOff();
 }
 
-// ---------- date-specific hours ----------
+// ---------- date-specific hours: a week grid of real dates ----------
 // mine.dates[key] replaces the weekly pattern on that one date. An empty array
 // is a real value ("free for none of it"), so absence is the only way to say
 // "just use my weekly hours" -- hence the delete in clearOverride.
-// The tab's buttons stay in the DOM even when the link didn't check out, so
+// The tab's controls stay in the DOM even when the link didn't check out, so
 // every entry point checks that there is actually a record to edit.
-const editable = () => !!(state && mine && !mine.error && mine.dates && ovDate);
+const editable = () => !!(state && mine && !mine.error && mine.dates && wkStart);
 const weeklyHoursFor = (key) => mine.avail[state.days[(atNoon(key).getDay() + 6) % 7]] || [];
-const overrideFor = (key) => mine.dates[key];
+// What this date resolves to today: its own hours if it has them, else weekly.
+const effectiveHours = (key) =>
+  mine.dates[key] !== undefined ? mine.dates[key] : weeklyHoursFor(key);
+const isAway = (key) => (mine.off || []).includes(key);
+const editableDate = (key) => key >= state.today && key <= state.seasonEnd;
 
-function renderOverrides() {
+// Monday of the week containing `key`.
+function mondayOf(key) {
+  const d = atNoon(key);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return iso(d);
+}
+
+function weekKeys() {
+  const out = [];
+  const d = atNoon(wkStart);
+  for (let i = 0; i < 7; i++) { out.push(iso(d)); d.setDate(d.getDate() + 1); }
+  return out;
+}
+
+function renderWeek() {
   if (!editable() || mePane !== "dates") return;
-  const key = ovDate;
-  if ($("ovdate").value !== key) $("ovdate").value = key;
-  $("ovdate").min = state.today;
-  $("ovdate").max = state.seasonEnd;
+  // A background poll re-renders every 15s; doing that mid-drag would swap out
+  // the nodes the drag is riding on. The pointerup handler re-renders anyway.
+  if (paintTo !== null) return;
+  const keys = weekKeys();
+  const first = atNoon(keys[0]), last = atNoon(keys[6]);
+  $("wk-range").textContent =
+    `${first.toLocaleDateString([], {month:"long", day:"numeric"})} – ` +
+    `${last.toLocaleDateString([], {month:"long", day:"numeric", year:"numeric"})}`;
 
-  const custom = overrideFor(key);
-  const hours = custom !== undefined ? custom : weeklyHoursFor(key);
-  const away = (mine.off || []).includes(key);
-  $("ov-state").innerHTML = away
-    ? `<b>${esc(fullLabel(key))}</b> — you're marked away all day, so these hours won't count.`
-    : custom !== undefined
-      ? `<b>${esc(fullLabel(key))}</b> — using hours set just for this date.`
-      : `<b>${esc(fullLabel(key))}</b> — following your usual ${state.days[(atNoon(key).getDay() + 6) % 7]} hours.`;
+  let html = `<div></div>`;   // empty corner above the time gutter
+  keys.forEach(key => {
+    const d = atNoon(key);
+    const own = mine.dates[key] !== undefined;
+    const usable = editableDate(key);
+    html += `<div class="wk-h${key === state.today ? " today" : ""}${usable ? " pick" : ""}"
+      ${usable ? `data-col="${key}"` : ""} title="${usable ? "Fill or clear " + fullLabel(key) : fullLabel(key)}">
+      <div class="dw">${d.toLocaleDateString([], {weekday:"short"}).toUpperCase()}</div>
+      <div class="dd">${d.toLocaleDateString([], {month:"short", day:"numeric"})}</div>
+      ${own && usable ? `<button class="wk-reset" data-reset="${key}"
+        title="Go back to my weekly hours on this date">↺ weekly</button>` : ""}
+    </div>`;
+  });
 
-  $("ov-slots").innerHTML = state.hourLabels.map((label, h) => {
-    const on = hours.includes(h);
-    return `<button class="slot${on ? " on" : ""}" data-h="${h}">${on ? "✓ " : ""}${label}</button>`;
-  }).join("");
+  state.hourLabels.forEach((label, h) => {
+    html += `<div class="wk-t">${(state.hourStarts || [])[h] || label.split("-")[0]}</div>`;
+    keys.forEach(key => {
+      const cls = ["wk-c"];
+      if (key > state.seasonEnd) cls.push("out");
+      else if (!editableDate(key)) cls.push("past");
+      if (isAway(key)) cls.push("away");
+      else {
+        if (effectiveHours(key).includes(h)) cls.push("on");
+        if (mine.dates[key] !== undefined) cls.push("own");
+      }
+      html += `<div class="${cls.join(" ")}" data-key="${key}" data-h="${h}"></div>`;
+    });
+  });
+  $("week").innerHTML = html;
+  renderOvList();
+}
 
+function renderOvList() {
   const keys = Object.keys(mine.dates).sort();
+  const shown = weekKeys();
   $("ov-list").innerHTML = keys.length ? keys.map(k => {
     const list = mine.dates[k];
-    const text = list.length
-      ? list.map(h => state.hourLabels[h]).join(", ")
-      : "free for none of it";
-    return `<div class="ovrow${k === key ? " on" : ""}">
+    const text = list.length ? list.map(h => state.hourLabels[h]).join(", ") : "free for none of it";
+    return `<div class="ovrow${shown.includes(k) ? " on" : ""}">
       <div><b>${esc(fullLabel(k))}</b><div class="hrs">${esc(text)}</div></div>
       <div>
-        <button class="btn" data-open="${k}">Edit</button>
-        <button class="btn" data-drop="${k}">Remove</button>
+        <button class="btn" data-open="${k}">Show week</button>
+        <button class="btn" data-drop="${k}">Use weekly</button>
       </div>
     </div>`;
-  }).join("") : `<p class="hint">No date-specific hours yet — pick a date above and set them.</p>`;
+  }).join("") : `<p class="hint">No date-specific hours yet — paint any date above to give it its own.</p>`;
 }
 
-function setOvDate(key) {
+function showWeekOf(key) {
   if (!key) return;
-  ovDate = key;
-  renderOverrides();
+  wkStart = mondayOf(key);
+  renderWeek();
 }
 
-function shiftOvDate(days) {
+function shiftWeek(weeks) {
   if (!editable()) return;
-  const d = atNoon(ovDate);
-  d.setDate(d.getDate() + days);
+  const d = atNoon(wkStart);
+  d.setDate(d.getDate() + weeks * 7);
+  // Stay inside the season: past weeks aren't editable and weeks beyond the end
+  // would just be a blank grid.
   const key = iso(d);
-  if (key >= state.today && key <= state.seasonEnd) setOvDate(key);
+  const lo = mondayOf(state.today), hi = mondayOf(state.seasonEnd);
+  wkStart = key < lo ? lo : key > hi ? hi : key;
+  renderWeek();
 }
 
-// The first edit seeds from the weekly pattern, so tweaking one Tuesday doesn't
-// mean re-entering the whole day from scratch.
-function toggleOverrideHour(h) {
-  if (!editable()) return;
-  const current = overrideFor(ovDate);
-  const list = current !== undefined ? current.slice() : weeklyHoursFor(ovDate).slice();
+// Painting writes an override for the touched date, seeded from whatever that
+// date currently resolves to -- so adjusting one Tuesday never means re-entering
+// the whole day. Returns true when something actually changed.
+function setCell(key, h, on) {
+  if (!editable() || !editableDate(key) || isAway(key)) return false;
+  const list = effectiveHours(key).slice();
   const i = list.indexOf(h);
-  if (i === -1) list.push(h); else list.splice(i, 1);
+  if (on && i === -1) list.push(h);
+  else if (!on && i !== -1) list.splice(i, 1);
+  else if (mine.dates[key] !== undefined) return false;   // already an override, no change
   list.sort((a, b) => a - b);
-  mine.dates[ovDate] = list;
-  renderOverrides();
+  mine.dates[key] = list;
+  return true;
+}
+
+function toggleColumn(key) {
+  if (!editable() || !editableDate(key) || isAway(key)) return;
+  const full = effectiveHours(key).length === state.hourLabels.length;
+  mine.dates[key] = full ? [] : state.hourLabels.map((_, i) => i);
+  renderWeek();
 }
 
 function clearOverride(key) {
   if (!editable()) return;
   delete mine.dates[key];
-  renderOverrides();
+  renderWeek();
 }
 
 function setPane(which) {
@@ -1001,6 +1087,14 @@ $("best").onclick = (e) => {
   const cell = e.target.closest(".bcard[data-date]");
   if (cell) setSelected(cell.dataset.date, {show: true});
 };
+// Delegated so the button works even while the day's numbers are still loading.
+$("daybody").onclick = (e) => {
+  const jump = e.target.closest("[data-edit-date]");
+  if (!jump) return;
+  showWeekOf(jump.dataset.editDate);
+  setPane("dates");
+  setView("me", true);
+};
 $("datepick").onchange = () => setSelected($("datepick").value);
 $("d-prev").onclick = () => shiftSelected(-1);
 $("d-next").onclick = () => shiftSelected(1);
@@ -1019,26 +1113,52 @@ $("offmonths").onclick = (e) => {
 $("tab-week").onclick = () => setPane("week");
 $("tab-dates").onclick = () => setPane("dates");
 $("tab-off").onclick = () => setPane("off");
-$("ov-slots").onclick = (e) => {
-  const slot = e.target.closest(".slot[data-h]");
-  if (slot) toggleOverrideHour(+slot.dataset.h);
+// Drag-painting. Cells are repainted in place during the drag rather than
+// re-rendering the grid, because replacing the nodes mid-drag would break the
+// pointerover stream the drag depends on.
+function paintCell(cell) {
+  if (paintTo === null || !cell) return;
+  const {key, h} = cell.dataset;
+  if (!setCell(key, +h, paintTo)) return;
+  cell.classList.toggle("on", paintTo);
+  cell.classList.add("own");
+}
+
+$("week").addEventListener("pointerdown", (e) => {
+  const reset = e.target.closest("[data-reset]");
+  if (reset) return clearOverride(reset.dataset.reset);
+  const head = e.target.closest(".wk-h[data-col]");
+  if (head) return toggleColumn(head.dataset.col);
+  const cell = e.target.closest(".wk-c[data-key]");
+  if (!cell || cell.classList.contains("away")) return;
+  e.preventDefault();
+  // Touch implicitly captures the pointer to the first element, which would
+  // stop every other cell from seeing the drag.
+  try { cell.releasePointerCapture(e.pointerId); } catch (err) {}
+  paintTo = !cell.classList.contains("on");
+  paintCell(cell);
+});
+$("week").addEventListener("pointerover", (e) => {
+  if (paintTo !== null) paintCell(e.target.closest(".wk-c[data-key]"));
+});
+// Ends the drag wherever it finishes, including outside the grid or the window.
+const endPaint = () => {
+  if (paintTo === null) return;
+  paintTo = null;
+  renderWeek();     // refresh the headers' ↺ markers and the summary list
 };
+addEventListener("pointerup", endPaint);
+addEventListener("pointercancel", endPaint);
+
 $("ov-list").onclick = (e) => {
   const open = e.target.closest("[data-open]");
-  if (open) return setOvDate(open.dataset.open);
+  if (open) return showWeekOf(open.dataset.open);
   const drop = e.target.closest("[data-drop]");
   if (drop) clearOverride(drop.dataset.drop);
 };
-$("ovdate").onchange = () => setOvDate($("ovdate").value);
-$("ov-prev").onclick = () => shiftOvDate(-1);
-$("ov-next").onclick = () => shiftOvDate(1);
-$("ov-copy").onclick = () => {
-  if (editable()) { mine.dates[ovDate] = weeklyHoursFor(ovDate).slice(); renderOverrides(); }
-};
-$("ov-none").onclick = () => {
-  if (editable()) { mine.dates[ovDate] = []; renderOverrides(); }
-};
-$("ov-clear").onclick = () => clearOverride(ovDate);
+$("wk-prev").onclick = () => shiftWeek(-1);
+$("wk-next").onclick = () => shiftWeek(1);
+$("wk-today").onclick = () => showWeekOf(state.today);
 $("save").onclick = saveMine;
 $("clearall").onclick = () => { mine.avail = {}; renderMe(); };
 

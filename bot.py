@@ -862,8 +862,13 @@ def day_detail(data: dict, day: date) -> dict:
     key = day.isoformat()
     away = sorted(rec["name"] for rec in data.values() if key in off_dates(rec))
     # Who is on date-specific hours here rather than their usual weekly ones --
-    # this is what explains two Tuesdays looking different.
-    custom = sorted(rec["name"] for rec in data.values() if has_override(rec, day))
+    # this is what explains two Tuesdays looking different. Being away wins over
+    # an override, so those people are reported as away and not listed twice.
+    custom = sorted(
+        rec["name"]
+        for rec in data.values()
+        if has_override(rec, day) and key not in off_dates(rec)
+    )
     hours = [
         {
             "index": i,
