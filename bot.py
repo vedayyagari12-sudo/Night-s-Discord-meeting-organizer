@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -1161,6 +1162,7 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 _dashboard_runner = None  # set once the web dashboard binds; see main()
+_synced = False           # command tree synced once per process; see on_ready
 
 # Scheduled events change rarely but were being re-fetched from Discord on every
 # dashboard poll (every 15s, per guild) and every /events press, which
@@ -1554,17 +1556,36 @@ async def dashboard_state() -> dict:
 # ---------- events ----------
 @bot.event
 async def on_ready():
-    # Global syncs can take up to an hour to show up in Discord. Syncing to one
-    # guild is near-instant, so set GUILD_ID in .env while you're iterating.
-    if GUILD_ID:
-        guild = discord.Object(id=GUILD_ID)
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-        log.info("Commands synced to guild %s (instant)", GUILD_ID)
-    else:
-        await bot.tree.sync()
-        log.info("Commands synced globally (can take up to an hour to appear)")
     log.info("Logged in as %s", bot.user)
+
+    # on_ready fires again after every reconnect, and syncing the command tree
+    # is one of the most rate-limited things a bot can do -- repeating it on
+    # each resume is a reliable way to earn a Cloudflare block that then looks
+    # like the bot itself is broken. Once per process is enough.
+    global _synced
+    if not _synced:
+        _synced = True
+        try:
+            # Global syncs can take up to an hour to show up in Discord. Syncing
+            # to one guild is near-instant, so set GUILD_ID in .env while you're
+            # iterating.
+            if GUILD_ID:
+                guild = discord.Object(id=GUILD_ID)
+                bot.tree.copy_global_to(guild=guild)
+                await bot.tree.sync(guild=guild)
+                log.info("Commands synced to guild %s (instant)", GUILD_ID)
+            else:
+                await bot.tree.sync()
+                log.info("Commands synced globally (can take up to an hour to appear)")
+        except discord.HTTPException as exc:
+            # A failed sync leaves the previously registered commands in place,
+            # so the bot is still usable -- don't take it down over this.
+            _synced = False
+            log.error(
+                "Could not sync commands (HTTP %s): %s",
+                exc.status,
+                summarise_response(exc.text),
+            )
 
     # Warm the event cache now so the first dashboard visit doesn't pay for it.
     for guild in bot.guilds:
@@ -1958,6 +1979,102 @@ async def reschedule(
     await interaction.followup.send(embed=embed)
 
 
+# Reconnect backoff for a Discord login that fails for a reason that might
+# clear up on its own -- a Cloudflare challenge on the host's IP, a 5xx, or the
+# network being briefly unavailable during a deploy.
+CONNECT_RETRY_BASE = 30
+CONNECT_RETRY_MAX = 600
+
+
+def summarise_response(text: str | None, limit: int = 300) -> str:
+    """Collapse an error body to one line.
+
+    Discord's API sometimes answers with an HTML page instead of JSON -- most
+    often a Cloudflare challenge aimed at the host's IP address. Dumping that
+    whole page into the logs buries the actual problem, so name it instead.
+    """
+    body = (text or "").strip()
+    if not body:
+        return "(empty response)"
+    lowered = body.lower()
+    if "<html" in lowered or "<!doctype html" in lowered:
+        if "challenge-platform" in lowered or "cloudflare" in lowered or "cf-ray" in lowered:
+            return (
+                "a Cloudflare challenge page -- Discord is challenging this host's IP "
+                "rather than answering the API call"
+            )
+        return "an HTML error page instead of a JSON API response"
+    return " ".join(body[:limit].split())
+
+
+def reset_client() -> bool:
+    """Put the client back into a state where start() can be called again.
+
+    close() leaves the client unusable in two ways: it marks it closed, and it
+    drops the loop reference. login() only re-runs its setup hook when it sees
+    the "no loop yet" sentinel, so both have to be put back or the next start()
+    would run against a half-initialised client. Returns False if anything about
+    that is not exactly as expected, in which case the caller should let the
+    process restart instead of pressing on with a broken client.
+    """
+    sentinel = getattr(discord.client, "_loop", None)
+    if sentinel is None:      # discord.py changed its internals
+        return False
+    try:
+        bot.clear()
+        bot.loop = sentinel
+    except Exception:
+        log.exception("Could not reset the Discord client for another attempt")
+        return False
+    return not bot.is_closed()
+
+
+async def connect_discord() -> None:
+    """Run the Discord client, retrying failures that may be temporary.
+
+    Exiting the process on a transient failure just hands Render a crash loop,
+    and takes the dashboard down with it. A bad token is different: no amount of
+    retrying fixes that, so it is reported and gives up.
+    """
+    delay = CONNECT_RETRY_BASE
+    while True:
+        try:
+            await bot.start(cast(str, TOKEN))
+            return                              # clean shutdown
+        except discord.LoginFailure:
+            log.error(
+                "Discord rejected the bot token. Check DISCORD_BOT_TOKEN -- if you "
+                "regenerated it in the Developer Portal, update it here too."
+            )
+            return
+        except discord.PrivilegedIntentsRequired:
+            log.error(
+                "Discord refused the requested intents. Enable them for this bot in the "
+                "Developer Portal under Bot -> Privileged Gateway Intents."
+            )
+            return
+        except discord.HTTPException as exc:
+            log.error(
+                "Discord returned HTTP %s while connecting: %s",
+                exc.status,
+                summarise_response(exc.text),
+            )
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+            log.error("Could not reach Discord: %s", exc)
+        finally:
+            # Without this the client's aiohttp connector is left open, which is
+            # what produced the "Unclosed connector" error on shutdown.
+            await bot.close()
+
+        if not reset_client():
+            log.error("Cannot reuse the Discord client; exiting so the host starts a fresh process")
+            return
+
+        log.info("Retrying the Discord connection in %ss (the dashboard stays up)", delay)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, CONNECT_RETRY_MAX)
+
+
 async def run_bot() -> None:
     """Bind the web port first, then connect to Discord.
 
@@ -1977,7 +2094,7 @@ async def run_bot() -> None:
             get_day=dashboard_day,
         )
     try:
-        await bot.start(cast(str, TOKEN))
+        await connect_discord()
     finally:
         # Flush the last save before the process goes away.
         await storage_close()
