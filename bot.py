@@ -28,6 +28,7 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord.utils import MISSING
 from dotenv import load_dotenv
 
 from dashboard import start_dashboard
@@ -2010,12 +2011,20 @@ def summarise_response(text: str | None, limit: int = 300) -> str:
 def reset_client() -> bool:
     """Put the client back into a state where start() can be called again.
 
-    close() leaves the client unusable in two ways: it marks it closed, and it
-    drops the loop reference. login() only re-runs its setup hook when it sees
-    the "no loop yet" sentinel, so both have to be put back or the next start()
-    would run against a half-initialised client. Returns False if anything about
-    that is not exactly as expected, in which case the caller should let the
-    process restart instead of pressing on with a broken client.
+    close() leaves the client unusable in three ways, and all of them have to be
+    undone or the next start() fails in a confusing place:
+
+    * it marks the client closed;
+    * it drops the loop reference, and login() only re-runs its setup hook when
+      it sees the "no loop yet" sentinel;
+    * it closes the HTTP session, and an aiohttp session closes the connector it
+      owns. clear() drops the dead session but keeps the dead connector, and the
+      fresh session login() builds around a closed connector reports itself
+      closed -- surfacing as "RuntimeError: Session is closed" on the next call.
+
+    Returns False if the result isn't exactly what's expected, in which case the
+    caller should let the process restart rather than press on with a client
+    that will fail in a less obvious way later.
     """
     sentinel = getattr(discord.client, "_loop", None)
     if sentinel is None:      # discord.py changed its internals
@@ -2023,6 +2032,11 @@ def reset_client() -> bool:
     try:
         bot.clear()
         bot.loop = sentinel
+        bot.http.connector = MISSING
+        # Verify rather than assume: these are the two things login() checks
+        # before rebuilding its HTTP layer.
+        if getattr(bot.http, "_HTTPClient__session", MISSING) is not MISSING:
+            return False
     except Exception:
         log.exception("Could not reset the Discord client for another attempt")
         return False
